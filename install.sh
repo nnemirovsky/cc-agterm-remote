@@ -253,7 +253,7 @@ for pair in ".bashrc cc-agterm-remote" ".bashrc cc-agterm-remote-title" ".tmux.c
     [ -f "$f" ] || continue
     awk -v b="# >>> $2 >>>" -v e="# <<< $2 <<<" '$0 == b {skip = 1; next} $0 == e {skip = 0; next} !skip' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 done
-rm -rf "$HOME/.cache/cc-agterm-remote/quiet" "$HOME/.cache/cc-agterm-remote/clipboard.sock"
+rm -rf "$HOME/.cache/cc-agterm-remote/quiet" "$HOME"/.cache/cc-agterm-remote/clipboard*.sock
 EOS
     say "removed the server side on $HOST"
 }

@@ -117,20 +117,26 @@ sync_names &
 trap 'kill %1 2>/dev/null' EXIT
 
 while :; do
-    # Each connection first makes the server's directory (owner only) and clears
-    # a socket a dropped connection left, which would make the forward fail:
-    # sshd removes a stale socket only with StreamLocalBindUnlink, off by
-    # default. It also learns the remote home, since a forwarded socket path
-    # must be absolute.
-    rhome="$(ssh -o ConnectTimeout=10 "$HOST" \
-        "mkdir -p ~/$REMOTE_STATE && chmod 700 ~/$REMOTE_STATE && rm -f ~/$REMOTE_STATE/clipboard.sock && printf %s \"\$HOME\"" 2>/dev/null)"
+    # Each connection forwards its own socket, clipboard.<id>.sock, and points
+    # the clipboard.sock link the server's scripts use at it once it is up. One
+    # fixed path would break: sshd unlinks a forwarded socket when that
+    # connection ends, and an old connection the server notices dead only later
+    # would delete the path the new one had just bound.
+    #
+    # First, over a short connection: make the directory (owner only), drop
+    # sockets of connections that are gone (nothing answers on them), and learn
+    # the remote home, since a forwarded socket path must be absolute.
+    id="$$-$(date +%s)"
+    rhome="$(ssh -o ConnectTimeout=10 "$HOST" "mkdir -p ~/$REMOTE_STATE && chmod 700 ~/$REMOTE_STATE &&
+        for s in ~/$REMOTE_STATE/clipboard.*.sock; do
+            [ -S \"\$s\" ] && command -v nc >/dev/null && ! nc -z -U \"\$s\" 2>/dev/null && rm -f \"\$s\"
+        done; printf %s \"\$HOME\"" 2>/dev/null)"
     if [ -n "$rhome" ]; then
-        forward=(-R "$rhome/$REMOTE_STATE/clipboard.sock:$CLIPBOARD_SOCK")
-        # A failed forward (the socket in use) only loses the clipboard; the
-        # status tail keeps running.
+        forward=(-R "$rhome/$REMOTE_STATE/clipboard.$id.sock:$CLIPBOARD_SOCK")
+        # A failed forward only loses the clipboard; the status tail keeps running.
         ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=no \
             "${forward[@]}" "$HOST" \
-            "touch ~/$REMOTE_STATE/status.jsonl; tail -F -n0 ~/$REMOTE_STATE/status.jsonl" 2>/dev/null |
+            "ln -sfn clipboard.$id.sock ~/$REMOTE_STATE/clipboard.sock; touch ~/$REMOTE_STATE/status.jsonl; tail -F -n0 ~/$REMOTE_STATE/status.jsonl" 2>/dev/null |
         while IFS= read -r line; do
             sid="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
             state="$(jq -r '.state // empty' <<<"$line" 2>/dev/null)"

@@ -2,9 +2,10 @@
 # Sourced by xclip and cc-remote-open: sends stdin to the Mac over the socket
 # cc-remote-bridge forwards, and prints the answer. Not run on its own.
 #
-# The socket is ~/.cache/cc-agterm-remote/clipboard.sock, in a directory only
-# you can open, and the socket itself is owner-only (sshd's default
-# StreamLocalBindMask), so no other user on this machine can reach the Mac.
+# The socket is ~/.cache/cc-agterm-remote/clipboard.sock, a link to the one the
+# current bridge connection forwards, in a directory only you can open; the
+# socket itself is owner-only (sshd's default StreamLocalBindMask), so no other
+# user on this machine can reach the Mac.
 
 CC_REMOTE_SOCK="${CC_REMOTE_SOCK:-$HOME/.cache/cc-agterm-remote/clipboard.sock}"
 
