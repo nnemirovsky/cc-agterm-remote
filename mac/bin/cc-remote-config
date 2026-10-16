@@ -1,0 +1,34 @@
+# shellcheck shell=bash disable=SC2034
+# Sourced by the Mac-side cc-agterm-remote scripts: reads the configuration and
+# sets the names they share. Not run on its own.
+#
+#   CC_REMOTE_CONFIG   the configuration file (~/.config/cc-agterm-remote/config)
+
+CC_REMOTE_CONFIG="${CC_REMOTE_CONFIG:-$HOME/.config/cc-agterm-remote/config}"
+# shellcheck source=/dev/null
+[ -f "$CC_REMOTE_CONFIG" ] && . "$CC_REMOTE_CONFIG"
+
+HOST="${CC_REMOTE_HOST:-}"
+NAME="${CC_REMOTE_NAME:-$HOST}"
+STATE="$HOME/.config/cc-agterm-remote"
+MAP="$STATE/map.json"
+CLIPBOARD_SOCK="$STATE/clipboard.sock"
+AGTERMCTL="${AGTERMCTL:-$(command -v agtermctl || echo /Applications/agterm.app/Contents/MacOS/agtermctl)}"
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Where the server keeps what these scripts and the status hook share, relative
+# to the remote home.
+REMOTE_STATE=".cache/cc-agterm-remote"
+
+# A chord runs these with stderr going nowhere, so a failure is also posted as
+# a desktop notification.
+notify_fail() {
+    echo "$*" >&2
+    "$AGTERMCTL" notify "$*" --title "$(basename "$0")" >/dev/null 2>&1
+}
+
+need_host() {
+    [ -n "$HOST" ] && return 0
+    notify_fail "no server configured: set CC_REMOTE_HOST in $CC_REMOTE_CONFIG"
+    exit 1
+}

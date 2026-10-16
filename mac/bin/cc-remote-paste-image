@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Put the Mac clipboard image into a Claude Code session running on the server.
+#
+#   cc-remote-paste-image            clipboard -> server, type the path into the active pane
+#   cc-remote-paste-image --print    upload and print the remote path, type nothing
+#   cc-remote-paste-image --file P   use P instead of the clipboard
+#   cc-remote-paste-image --force    skip the "is this pane remote?" check
+#
+# The fallback for Ctrl+V. With the bridge up, Ctrl+V in a remote Claude Code
+# prompt reaches the Mac clipboard through the xclip stand-in; this works
+# without it. It copies the image over and types its path instead, and Claude
+# then reads the file and sees the image.
+#
+#   CC_REMOTE_PASTE_DIR        where uploads go, relative to the remote home
+#                              (.cache/cc-agterm-remote/pasted-images)
+#   CC_REMOTE_PASTE_KEEP_DAYS  uploads older than this many days are pruned (7)
+set -uo pipefail
+# shellcheck source=cc-remote-config
+. "$(dirname "$0")/cc-remote-config"
+need_host
+
+REMOTE_DIR="${CC_REMOTE_PASTE_DIR:-$REMOTE_STATE/pasted-images}"
+KEEP_DAYS="${CC_REMOTE_PASTE_KEEP_DAYS:-7}"
+case "$KEEP_DAYS" in ''|*[!0-9]*) KEEP_DAYS=7 ;; esac
+TARGET="${AGT_SESSION_ID:-active}"
+
+mode="type"; src=""; force=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --print) mode=print ;;
+        --file)  src="${2:-}"; shift ;;
+        --force) force=1 ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# Bound to an agterm chord, stderr goes nowhere, so surface failures as a
+# desktop notification too.
+die() {
+    echo "$*" >&2
+    [ "$mode" = print ] || "$AGTERMCTL" notify "$*" --title "cc-remote-paste-image" >/dev/null 2>&1
+    exit 1
+}
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/cc-remote-paste.XXXXXX")" || die "cannot create a temp dir"
+trap 'rm -rf "$tmp"' EXIT
+
+# --- 1. get the image out of the clipboard -----------------------------------
+# osascript rather than pngpaste so this needs nothing installed. Order matters:
+# a file copied in Finder keeps its own format, a screenshot is PNG, and an image
+# dragged out of some apps only lands as TIFF.
+write_flavor() {  # <AppleScript class> <out file>
+    osascript >/dev/null 2>&1 \
+        -e "set f to (open for access POSIX file \"$2\" with write permission)" \
+        -e "set eof f to 0" \
+        -e "write (the clipboard as «class $1») to f" \
+        -e "close access f"
+    [ -s "$2" ]
+}
+
+if [ -z "$src" ]; then
+    flavors="$(osascript -e 'clipboard info' 2>/dev/null)"
+    case "$flavors" in
+        *furl*)
+            f="$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null)"
+            case "${f##*.}" in
+                png|PNG|jpg|JPG|jpeg|JPEG|gif|GIF|webp|WEBP|heic|HEIC|bmp|BMP) src="$f" ;;
+            esac ;;
+    esac
+    if [ -z "$src" ] && write_flavor PNGf "$tmp/clip.png"; then
+        src="$tmp/clip.png"
+    elif [ -z "$src" ] && write_flavor TIFF "$tmp/clip.tiff"; then
+        sips -s format png "$tmp/clip.tiff" --out "$tmp/clip.png" >/dev/null 2>&1 \
+            || die "clipboard holds a TIFF image that sips could not convert"
+        src="$tmp/clip.png"
+    fi
+fi
+[ -n "$src" ] || die "no image in the clipboard (copy a screenshot or an image file first)"
+[ -r "$src" ] || die "cannot read $src"
+
+# --- 2. make sure the pane is actually remote --------------------------------
+# Typing a remote path into a local session would be pure confusion, and a
+# local Cmd+V already works there.
+if [ "$force" = 0 ] && [ "$mode" = type ]; then
+    fg="$("$AGTERMCTL" tree --json 2>/dev/null | jq -r --arg id "$TARGET" '
+        [ .result.tree.workspaces[]
+          | select($id != "active" or .active)
+          | .sessions[]
+          | select(.id == $id or ($id == "active" and .active)) ]
+        | .[0].foreground // [] | join(" ")' 2>/dev/null)"
+    case "$fg" in
+        *ssh*) ;;
+        *) die "this pane is not an ssh session — Cmd+V already works locally (--force to override)" ;;
+    esac
+fi
+
+# --- 3. copy it over ---------------------------------------------------------
+ext="${src##*.}"; case "$ext" in "$src"|*[!A-Za-z0-9]*) ext=png ;; esac
+name="paste-$(date +%Y%m%d-%H%M%S)-$$.$ext"
+
+remote="$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$HOST" \
+    "mkdir -p \"\$HOME/$REMOTE_DIR\" && cat > \"\$HOME/$REMOTE_DIR/$name\" &&
+     find \"\$HOME/$REMOTE_DIR\" -type f -mtime +$KEEP_DAYS -delete 2>/dev/null
+     printf '%s/%s/%s' \"\$HOME\" '$REMOTE_DIR' '$name'" < "$src")" \
+    || die "could not copy the image to $HOST"
+[ -n "$remote" ] || die "$HOST did not report a path for the image"
+
+# --- 4. hand the path to the session -----------------------------------------
+if [ "$mode" = print ]; then
+    printf '%s\n' "$remote"
+    exit 0
+fi
+
+# A trailing space so the next thing typed does not glue itself to the path.
+"$AGTERMCTL" session type "$remote " --target "$TARGET" >/dev/null \
+    || die "copied to $remote but could not type it into the pane"

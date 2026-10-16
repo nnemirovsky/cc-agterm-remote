@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code remote-control server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# RC_DIR, RC_NAME and the PATH of your login shell, written by `claude-rc add`.
+EnvironmentFile=%h/.config/cc-agterm-remote/rc/%i.env
+Environment=TERM=xterm-256color
+# A session the app starts here has no browser to open; this keeps tools that
+# honour BROWSER (gh, OAuth prompts) from waiting on one.
+Environment=BROWSER=true
+ExecStart=/usr/bin/expect %h/.local/bin/claude-rc-start
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

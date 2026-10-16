@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Stand-in for xclip on the server: hands Claude Code the Mac clipboard, so
+# Ctrl+V pastes an image into a remote session the way it does locally. Claude
+# Code on Linux runs exactly these:
+#   xclip -selection clipboard -t TARGETS -o      (is there an image?)
+#   xclip -selection clipboard -t image/png -o    (the image)
+#   xclip -selection clipboard                    (copy: text on stdin)
+# and they are answered by cc-remote-clipboard on the Mac, through the socket
+# cc-remote-bridge forwards (see cc-remote-talk). With the bridge down this
+# fails like a missing xclip, and Claude Code says there is no image.
+# Installed only where no real xclip exists; anything else (text reads, other
+# selections) fails the same way.
+# shellcheck source=cc-remote-talk
+. "$(dirname "$0")/cc-remote-talk"
+sel="" target="" out=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -selection|-sel) sel="$2"; shift ;;
+        -t|-target) target="$2"; shift ;;
+        -o|-out) out=1 ;;
+        -i|-in) out=0 ;;
+    esac
+    shift
+done
+[ "$sel" = clipboard ] || exit 1
+
+if [ "$out" = 1 ]; then
+    case "$target" in
+        TARGETS) r="$(printf 'targets\n' | talk)"; [ -n "$r" ] && printf '%s\n' "$r" || exit 1 ;;
+        image/png) printf 'image/png\n' | talk || exit 1 ;;
+        *) exit 1 ;;
+    esac
+else
+    [ -z "$target" ] || [ "$target" = text/plain ] || [ "$target" = UTF8_STRING ] || exit 1
+    { printf 'copy\n'; cat; } | talk || exit 1
+fi

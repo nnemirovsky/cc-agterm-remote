@@ -1,0 +1,28 @@
+# shellcheck shell=bash
+# Sourced by xclip and cc-remote-open: sends stdin to the Mac over the socket
+# cc-remote-bridge forwards, and prints the answer. Not run on its own.
+#
+# The socket is ~/.cache/cc-agterm-remote/clipboard.sock, in a directory only
+# you can open, and the socket itself is owner-only (sshd's default
+# StreamLocalBindMask), so no other user on this machine can reach the Mac.
+
+CC_REMOTE_SOCK="${CC_REMOTE_SOCK:-$HOME/.cache/cc-agterm-remote/clipboard.sock}"
+
+# Fails at once when the bridge is down (no socket, or nothing behind it).
+talk() {
+    [ -S "$CC_REMOTE_SOCK" ] || return 1
+    if nc -h 2>&1 | grep -q -- '-U'; then
+        # -N: shut down the sending side at the end of stdin, then read the answer.
+        nc -N -U "$CC_REMOTE_SOCK"
+    else
+        python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(sys.stdin.buffer.read())
+s.shutdown(socket.SHUT_WR)
+for chunk in iter(lambda: s.recv(65536), b""):
+    sys.stdout.buffer.write(chunk)
+' "$CC_REMOTE_SOCK"
+    fi
+}

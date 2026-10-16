@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Server side of the agterm status bridge.
+#
+# Claude Code hooks call this with the state as $1 and the hook payload on
+# stdin (install.sh adds them to ~/.claude/settings.json). It appends one line
+# per event to ~/.cache/cc-agterm-remote/status.jsonl; cc-remote-bridge on the
+# Mac tails that file and paints the agterm glyph for whichever pane holds this
+# session.
+#
+# Never writes to stdout (a UserPromptSubmit hook's stdout is injected into the
+# prompt) and always exits 0 (a non-zero exit can block the turn).
+set -u
+
+state="${1:-active}"
+dir="$HOME/.cache/cc-agterm-remote"
+journal="$dir/status.jsonl"
+
+payload="$(cat 2>/dev/null || true)"
+sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null || true)"
+[ -n "$sid" ] || exit 0
+
+# A turn cc-remote-attach started itself (the note after a restart) stays quiet:
+# its marker swallows the busy and done states, so the pane shows no status or
+# badge for it. A question to the user still gets through and ends the quiet.
+quiet="$dir/quiet/$sid"
+if [ -f "$quiet" ] && [ -n "$(find "$quiet" -mmin -30 2>/dev/null)" ]; then
+    case "$state" in
+        active) exit 0 ;;
+        completed) rm -f "$quiet"; exit 0 ;;
+        *) rm -f "$quiet" ;;
+    esac
+fi
+
+mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
+
+# CC_REMOTE_PANE is set by cc-remote-attach in a plain ssh pane, so a claude
+# started by hand in that shell still resolves to the right agterm pane.
+printf '%s' "$payload" | jq -c --arg state "$state" --arg pane "${CC_REMOTE_PANE:-}" --argjson ts "$(date +%s)" \
+    '{ts: $ts, session_id: .session_id, state: $state, cwd: (.cwd // ""), pane: $pane}' >> "$journal" 2>/dev/null || true
+
+# Keep the journal bounded: past 5000 lines, keep the last 500.
+lines="$(wc -l < "$journal" 2>/dev/null || echo 0)"
+if [ "$lines" -gt 5000 ] 2>/dev/null; then
+    tail -n 500 "$journal" > "$journal.tmp" 2>/dev/null && mv "$journal.tmp" "$journal"
+fi
+
+exit 0

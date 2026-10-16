@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart Claude Code remote-control servers left on an older build
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=RC_IDLE_HOURS=8
+ExecStart=%h/.local/bin/claude-rc-refresh

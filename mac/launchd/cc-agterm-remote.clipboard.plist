@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>cc-agterm-remote.clipboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@BIN@/cc-remote-clipboard</string>
+    </array>
+    <key>inetdCompatibility</key>
+    <dict>
+        <key>Wait</key>
+        <false/>
+    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>Listeners</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>@STATE@/clipboard.sock</string>
+            <!-- 0600: only you can connect -->
+            <key>SockPathMode</key>
+            <integer>384</integer>
+        </dict>
+    </dict>
+</dict>
+</plist>

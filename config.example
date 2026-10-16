@@ -1,0 +1,20 @@
+# cc-agterm-remote configuration, read by every Mac-side script and by
+# install.sh. Copy it to ~/.config/cc-agterm-remote/config and edit.
+# It is sourced by bash, so keep to plain assignments.
+
+# The ssh host the sessions run on, as you would type it after `ssh`. Set up
+# key-based access and an entry in ~/.ssh/config first: the scripts run ssh
+# non-interactively and expect it to connect without a prompt.
+CC_REMOTE_HOST=devbox
+
+# What the pickers, chords and messages call the server. Defaults to the host.
+#CC_REMOTE_NAME=devbox
+
+# Where the "new session" picker looks for git repositories on the server,
+# up to three levels deep. Relative to the remote home, or absolute.
+#CC_REMOTE_ROOTS=(dev src)
+
+# Extra rows for the "new session" picker, as "path=label". Relative to the
+# remote home, or absolute. Directories that host a remote-control server
+# (claude-rc) are listed first without being named here.
+#CC_REMOTE_DIRS=("dev/work=work root")

@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+# Open a remote Claude Code session in a fresh agterm pane, and register the
+# pane so `cc-remote-bridge` can paint its agent-status glyph.
+#
+#   cc-remote-attach                 pick a claude session, then attach / restart / kill / clean up /
+#                                    cancel (stopped sessions sit under a separator, newest first,
+#                                    pick to resume or clean up)
+#   cc-remote-attach <id>            attach that session
+#   cc-remote-attach --restart <id>  restart a running session in place (see restart_session)
+#   cc-remote-attach --new [dir]     start a claude background session (agents-managed, default)
+#   cc-remote-attach --direct <dir>  start a direct tmux session (default renderer, not agents-managed)
+#   cc-remote-attach --shell [dir]   open a plain ssh shell, wired into the status bridge
+#   cc-remote-attach --kill          pick a running session and stop its process
+#   cc-remote-attach --stop-pane [P] restart, or stop, the session attached in agterm pane P
+#                                    (default: the pane the chord fired in); stopping closes
+#                                    that pane, optionally removing its worktree and branch
+#   cc-remote-attach --list          print the remote sessions and exit
+#
+# "Clean up" removes the linked worktree a session runs in together with its branch,
+# or, in a repo's main checkout, switches to the default branch and deletes the
+# session's branch. It is offered only when nothing would be lost: no uncommitted
+# changes, and every commit already on the remote (pushed, or merged into the
+# default branch).
+#
+# The pane runs `ssh -t <host> claude attach <id>` through cc-remote-ssh. Closing
+# the pane leaves the session running on the server; reattaching re-registers the
+# new pane.
+set -uo pipefail
+# shellcheck source=cc-remote-config
+. "$(dirname "$0")/cc-remote-config"
+need_host
+
+mkdir -p "$STATE"
+[ -f "$MAP" ] || printf '{}\n' > "$MAP"
+
+die() {
+    notify_fail "$*"
+    exit 1
+}
+
+# Put first in every remote command: a non-interactive ssh shell may not have
+# ~/.local/bin, where Claude Code's native installer puts `claude`, on its PATH.
+RPATH='export PATH="$HOME/.local/bin:$PATH"; '
+
+q() { printf '%q' "$1"; }
+
+# Run the script on stdin with bash on the server, with these arguments. ssh
+# hands the remote shell one joined command line, so each argument is quoted
+# for it; passing them bare would split a path with a space.
+rbash() {
+    local args=""
+    [ $# -gt 0 ] && args="$(printf ' %q' "$@")"
+    ssh "$HOST" "bash -s --$args"
+}
+
+remote_sessions() {
+    ssh "$HOST" "${RPATH}claude agents --json" 2>/dev/null
+}
+
+# Every session, running and stopped, each with `active`: when its transcript was
+# last written (epoch seconds), falling back to its start. `claude agents` reports
+# only startedAt, which would sort a long-lived session stopped a minute ago below
+# one started yesterday.
+all_sessions() {
+    rbash <<'EOS' 2>/dev/null
+export PATH="$HOME/.local/bin:$PATH"
+s=$(claude agents --json --all) || exit 1
+m=$(find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -printf '%f\t%T@\n' 2>/dev/null |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+              | {key: (.[0] | sub("\\.jsonl$"; "")), value: (.[1] | tonumber)}) | from_entries')
+jq --argjson m "${m:-{\}}" 'map(. + {active: ($m[.sessionId // ""] // ((.startedAt // 0) / 1000))})' <<<"$s"
+EOS
+}
+
+# What stopping a session could also clean up, judged in its working directory on
+# the server: the linked worktree it runs in (and that worktree's branch), or, in
+# the main checkout, its non-default branch. One JSON line:
+#   {kind: worktree|branch|none, top, main, branch, default, blocker}
+# `blocker` names why cleaning up would lose work (changes to tracked files,
+# commits that are on no remote branch); the option is then shown but does
+# nothing. `untracked` lists untracked files, which a worktree removal deletes.
+cleanup_info() {
+    rbash "$1" <<'EOS' 2>/dev/null || echo '{"kind":"none"}'
+none() { echo '{"kind":"none"}'; exit 0; }
+cd "$1" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 || none
+top=$(git rev-parse --show-toplevel)
+gd=$(cd "$(git rev-parse --git-dir)" && pwd)
+common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+main=$(dirname "$common")
+branch=$(git symbolic-ref --short -q HEAD)
+def=$(git symbolic-ref --short -q refs/remotes/origin/HEAD); def=${def#origin/}; [ -n "$def" ] || def=main
+if [ "$gd" != "$common" ]; then kind=worktree
+elif [ -n "$branch" ] && [ "$branch" != "$def" ]; then kind=branch
+else none; fi
+blocker=""
+# Tracked changes block; untracked files (test results, build output) do not, but
+# are named so the row says what goes with the worktree.
+[ -n "$(git status --porcelain --untracked-files=no)" ] && blocker="uncommitted changes"
+untracked=$(git status --porcelain | sed -n 's/^?? //p' | head -3 | paste -sd, -)
+[ "$(git status --porcelain | grep -c '^??')" -gt 3 ] && untracked="$untracked, …"
+if [ -z "$blocker" ] && [ -n "$branch" ]; then
+    git fetch -q origin 2>/dev/null
+    if git merge-base --is-ancestor "$branch" "origin/$def" 2>/dev/null; then :
+    elif git rev-parse -q --verify "$branch@{u}" >/dev/null 2>&1 &&
+         [ "$(git rev-list --count "$branch@{u}..$branch")" = 0 ]; then :
+    else blocker="commits that are on no remote branch"; fi
+fi
+jq -nc --arg kind "$kind" --arg top "$top" --arg main "$main" --arg branch "$branch" \
+       --arg def "$def" --arg blocker "$blocker" --arg untracked "$untracked" \
+       '{kind: $kind, top: $top, main: $main, branch: $branch, default: $def, blocker: $blocker, untracked: $untracked}'
+EOS
+}
+
+# The picker row for cleaning up, from cleanup_info's JSON and a verb ("stop",
+# "kill", or empty for a stopped session). Prints nothing when there is nothing
+# to clean up.
+cleanup_row() {
+    local info="$1" verb="$2"
+    jq -c --arg verb "$verb" '
+        def lead: if $verb == "" then "" else "\($verb) + " end;
+        if .kind == "none" then empty
+        elif .blocker != "" then {id: "noclean", label: "clean up unavailable: \(.blocker)", subtitle: .top}
+        elif .kind == "worktree" then
+            (.main + "/") as $m | (.top | ltrimstr($m) | ltrimstr(".claude/worktrees/")) as $wt
+            | {id: "cleanup",
+               subtitle: (if (.untracked // "") != "" then "also deletes untracked \(.untracked) · \(.top)" else .top end),
+               label: (if $wt == .branch then "\(lead)remove worktree and branch \($wt)"
+                       else "\(lead)remove worktree \($wt) and branch \(.branch)" end)}
+        else {id: "cleanup", label: "\(lead)switch to \(.default) and delete branch \(.branch)",
+              subtitle: (if (.untracked // "") != "" then "untracked files stay: \(.untracked) · \(.top)" else .top end)} end' <<<"$info"
+}
+
+# The second picker's rows as one JSON array: each action as itself, and
+# "@cleanup:<verb>" as cleanup_row's row (or nothing). A function rather than a
+# loop inside $(...): macOS /bin/bash 3.2, which a chord runs under, cannot parse
+# a `case` pattern inside a command substitution.
+action_items() {
+    local info="$1" a
+    shift
+    for a in "$@"; do
+        case "$a" in
+            @cleanup:*) cleanup_row "$info" "${a#@cleanup:}" ;;
+            *) jq -nc --arg a "$a" '{id: $a, label: $a}' ;;
+        esac
+    done | jq -s -c .
+}
+
+# Carry out what cleanup_row offered: remove the worktree and its branch, or
+# switch the main checkout to its default branch and delete the old one. `git
+# worktree remove` itself refuses a worktree with changes, a second guard.
+do_cleanup() {
+    local info="$1"
+    rbash "$(jq -r .kind <<<"$info")" "$(jq -r .top <<<"$info")" \
+        "$(jq -r .main <<<"$info")" "$(jq -r .branch <<<"$info")" "$(jq -r .default <<<"$info")" <<'EOS' 2>&1 | tail -2
+set -e
+case "$1" in
+    # --force only lets untracked files go: cleanup_info already refused tracked changes.
+    worktree) git -C "$3" worktree remove --force "$2"; [ -z "$4" ] || git -C "$3" branch -D "$4"; echo "removed $2 and $4" ;;
+    branch) git -C "$2" switch -q "$5"; git -C "$2" branch -D "$4"; echo "switched $2 to $5 and deleted $4" ;;
+esac
+EOS
+}
+
+# Picker rows from `claude agents --json --all`. Labels come from `state`, not
+# `status`: `status` is busy/idle, while `state` tells working (busy) from
+# blocked (waiting — on a permission, a question, or just an external event
+# with nothing to act on). Rows that need attention sort first, then
+# app-started sessions, then — under a separator — stopped sessions, which
+# `claude attach` reopens with the conversation intact. "Stopped" means no
+# process (`pid` absent): `state` alone is not enough, since a session the
+# supervisor retired reads "done" but one stopped by hand reads "stopped".
+# A stopped session the app has already resumed (same sessionId) is hidden
+# behind its "from app" row. Stopped sessions list most recently active first
+# (`active`, from all_sessions).
+SEP_ID="sep"
+picker_rows() {
+    jq -c '
+        def running: .kind == "background" and has("pid");
+        def stopped: .kind == "background" and (has("pid") | not);
+        def order: if .state == "blocked" then 0 elif .state == "working" then 1 else 2 end;
+        def badge: if .state == "working" then "busy"
+                   elif .state == "blocked" then "waiting"
+                   else (.status // .state // "?") end;
+        ([.[] | select(.kind == "interactive") | .sessionId]) as $app
+        | ([.[] | select(running)] | sort_by(order)
+           | map({id: ("bg:" + .id), label: ("\(badge) · \(.name // .id)"), subtitle: .cwd}))
+        + [.[] | select(.kind != "background")
+           | {id: ("app:" + .sessionId), label: ("from app · \(.name)"), subtitle: .cwd}]
+        + ([.[] | select(stopped and (.sessionId | IN($app[]) | not))] | sort_by(-(.active // 0))
+           | if length == 0 then [] else
+               [{id: "'"$SEP_ID"'", label: "──────── stopped · pick to resume ────────"}]
+               + map({id: ("bg:" + .id), label: (.name // .id), subtitle: .cwd}) end)'
+}
+
+# Candidate working directories on the server. Every row starts the SAME thing —
+# a `claude --bg` session in that directory, no rc server involved — so the
+# subtitle describes the directory, not the server. Order is by likely use: the
+# dirs that also host a remote-control server first, then the CC_REMOTE_DIRS
+# rows, then repos under CC_REMOTE_ROOTS, then the roots and home. Worktrees are
+# left out: a session that needs one creates it. Prints "path<TAB>kind" lines,
+# after a first "~<TAB>remote home" line.
+remote_dirs() {
+    local args=() r d
+    for r in "${CC_REMOTE_ROOTS[@]+"${CC_REMOTE_ROOTS[@]}"}"; do args+=("root=$r"); done
+    for d in "${CC_REMOTE_DIRS[@]+"${CC_REMOTE_DIRS[@]}"}"; do args+=("dir=$d"); done
+    rbash "${args[@]+"${args[@]}"}" <<'EOS' 2>/dev/null
+abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$HOME" "$1" ;; esac; }
+printf '~\t%s\n' "$HOME"
+list=$(mktemp)
+{
+    # Directories hosting a claude-rc server, from their instance files.
+    for f in "$HOME"/.config/cc-agterm-remote/rc/*.env; do
+        [ -f "$f" ] || continue
+        d=$(sed -n 's/^RC_DIR=//p' "$f" | head -1)
+        [ -n "$d" ] && printf '%s\tremote control: %s\n' "$d" "$(basename "$f" .env)"
+    done
+    for a in "$@"; do
+        case "$a" in
+            dir=*=*) v=${a#dir=}; printf '%s\t%s\n' "$(abs "${v%%=*}")" "${v#*=}" ;;
+            dir=*) printf '%s\tdirectory\n' "$(abs "${a#dir=}")" ;;
+        esac
+    done
+    roots=0
+    for a in "$@"; do
+        case "$a" in root=*)
+            roots=1
+            r=$(abs "${a#root=}")
+            find "$r" -maxdepth 3 -name .git -printf '%h\trepo\n' 2>/dev/null | sort
+            printf '%s\tworkspace root\n' "$r" ;;
+        esac
+    done
+    [ "$roots" = 1 ] || find "$HOME" -maxdepth 3 -name .git -not -path '*/.*/*' -printf '%h\trepo\n' 2>/dev/null | sort
+    printf '%s\thome\n' "$HOME"
+} | awk -F'\t' '!seen[$1]++ && system("test -d \"" $1 "\"") == 0' > "$list"
+cat "$list"
+rm -f "$list"
+EOS
+}
+
+pick_dir() {
+    local out home items choice prompt="${1:-new $NAME session in…}"
+    out="$(remote_dirs)"
+    home="$(awk -F"\t" "NR == 1 {print \$2}" <<<"$out")"
+    items="$(sed '1d' <<<"$out" |
+        jq -R -s --arg home "$home/" '
+            split("\n") | map(select(length > 0) | split("\t")) |
+            map({id: .[0], label: (.[0] | ltrimstr($home)), subtitle: .[1]})')"
+
+    [ "$(jq -r 'length' <<<"$items" 2>/dev/null)" != "0" ] || die "no candidate directories found on $HOST"
+
+    choice="$(printf '%s' "$items" |
+        "$AGTERMCTL" pick --prompt "$prompt" --allow-custom 2>/dev/null |
+        jq -r 'select(.result == "picked" or .result == "custom") | (.id // .label) // empty')"
+    # A typed path is taken relative to the remote home.
+    # shellcheck disable=SC2088 # the patterns match a literal ~ the user typed
+    case "$choice" in
+        ""|/*) printf '%s' "$choice" ;;
+        "~") printf '%s' "$home" ;;
+        "~/"*) printf '%s/%s' "$home" "${choice#\~/}" ;;
+        *) printf '%s/%s' "$home" "$choice" ;;
+    esac
+}
+
+# The command a pane runs for remote command $1 (see cc-remote-ssh); further
+# args go before it (--pane).
+pane_cmd() {
+    local c
+    c="$(q "$BIN/cc-remote-ssh")"
+    while [ $# -gt 1 ]; do c="$c $1"; shift; done
+    printf '%s %s' "$c" "$(q "$RPATH$1")"
+}
+
+register() {
+    # Hooks report the session UUID; `claude agents`/`attach` use the short id.
+    # Map both so the bridge resolves a pane whichever one it sees.
+    local cc_id="$1" pane_id="$2" uuid tmp
+    uuid="$(remote_sessions | jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .sessionId // empty')"
+    tmp="$(mktemp)"
+    jq --arg s "$cc_id" --arg u "$uuid" --arg t "$pane_id" \
+       '.[$s] = $t | (if ($u | length) > 0 then .[$u] = $t else . end)' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+    [ -n "$uuid" ] && echo "  mapped uuid $uuid" >&2
+}
+
+kill_session() {
+    # Stop the process only. The job stays in ~/.claude/jobs, so the session
+    # moves under the picker's "stopped" separator and can be resumed later.
+    local cc_id="$1" pane tmp
+    ssh "$HOST" "${RPATH}claude stop $(q "$cc_id")" 2>&1 | tail -1
+
+    # Close its pane and drop it from the bridge map, if it had one.
+    pane="$(jq -r --arg s "$cc_id" '.[$s] // empty' "$MAP" 2>/dev/null)"
+    [ -n "$pane" ] && "$AGTERMCTL" session close --target "$pane" >/dev/null 2>&1
+    tmp="$(mktemp)"
+    jq --arg s "$cc_id" 'with_entries(select(.key | startswith($s) | not))' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+    echo "stopped $cc_id"
+}
+
+# Pull the background id out of what `claude --bg` prints.
+bg_id() {
+    grep -oE 'backgrounded · [0-9a-f]+' | awk '{print $3}'
+}
+
+takeover_pane() {
+    # Experimental. Move an app-started session into a supervised background
+    # session so it can be attached properly, then open it. `claude --bg
+    # --resume <full uuid>` keeps the id; the short id and a stale process would
+    # fork a copy instead, so the old process is stopped first and the FULL uuid
+    # is passed.
+    local uuid="$1" dir="$2" pid="$3" note new_id
+    case "$pid" in ''|*[!0-9]*) die "no process id for app session $uuid" ;; esac
+    note="This session was moved from the Claude app into a background session on $NAME. The previous process was stopped, so any background tasks, monitors or subagents it had running were terminated. Re-arm whatever still matters, then carry on."
+    [ -n "${CC_REMOTE_NO_TAKEOVER_NOTE:-}" ] && note=""
+
+    ssh "$HOST" "kill $pid 2>/dev/null; sleep 3; kill -9 $pid 2>/dev/null; true" >/dev/null 2>&1
+
+    new_id="$(ssh "$HOST" "${RPATH}cd $(q "$dir") && claude --bg --resume $(q "$uuid")${note:+ $(q "$note")}" 2>/dev/null | bg_id)"
+    [ -n "$new_id" ] || die "could not move $uuid into a background session"
+    open_pane "$new_id" "$(basename "$dir")"
+}
+
+# What Claude reads when its session comes back, so it restarts what the old
+# process took with it. $1 says how it came back ("restarted" or "resumed").
+restart_note() {
+    local how="$1"
+    printf '%s' "This session was $how from the terminal: its process was stopped and started again under the same id. Background shells, monitors and subagents it had running were terminated. Start again whichever of them still matter, with the same commands, except that a script from a plugin's versioned folder (~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/...) should run from the newest version installed there now, then carry on. If nothing was running, just say so in one line."
+}
+
+# Where pane $1 sits, as placement flags for `session new`: after the pane
+# before it, before the one after it, or at the end of its workspace.
+pane_place() {
+    "$AGTERMCTL" tree --json 2>/dev/null | jq -r --arg p "$1" '
+        .result.tree.workspaces[] | select(any(.sessions[]; .id == $p)) |
+        [.sessions[].id] as $ids | ($ids | index($p)) as $i |
+        if $i > 0 then "--after", $ids[$i - 1]
+        elif ($ids | length) > $i + 1 then "--before", $ids[$i + 1]
+        else "--workspace", .id end' 2>/dev/null
+}
+
+pane_exists() {
+    "$AGTERMCTL" tree --json 2>/dev/null |
+        jq -e --arg p "$1" 'any(.result.tree.workspaces[].sessions[]; .id == $p)' >/dev/null
+}
+
+# Bring a background session back with restart_note: stop its process if it
+# still has one, resume it under the same id with the note as its next prompt,
+# and attach it. A pane it already had is replaced in place (same spot in the
+# sidebar), any other pane is opened fresh. `--resume` needs the FULL uuid; the
+# short id would fork a copy.
+restart_session() {
+    local cc_id="$1" uuid="$2" dir="$3" how="$4" old new_id base place=()
+    old="$(jq -r --arg s "$cc_id" '.[$s] // empty' "$MAP" 2>/dev/null)"
+    # A pane whose attach ends with the session closes on its own (one agterm
+    # restored at launch has no --wait), so note its place before stopping.
+    [ -n "$old" ] && while IFS= read -r a; do place+=("$a"); done < <(pane_place "$old")
+    # `claude stop` returns, and `claude agents` drops the pid, before the
+    # process is gone, and resuming a session that still runs starts a copy
+    # under a new id. So wait for the process itself to exit.
+    if [ "$how" = "restarted" ]; then
+        rbash "$cc_id" <<'EOS' >/dev/null 2>&1 || die "session $cc_id did not stop"
+export PATH="$HOME/.local/bin:$PATH"
+pid=$(claude agents --json | jq -r --arg i "$1" '.[] | select(.id == $i) | .pid // empty')
+claude stop "$1" || exit 1
+[ -n "$pid" ] || exit 0
+for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || exit 0
+    sleep 1
+done
+exit 1
+EOS
+    fi
+
+    # The note's turn is ours, not the user's: cc-remote-status keeps it from
+    # lighting the pane's status and badge.
+    ssh "$HOST" "mkdir -p ~/$REMOTE_STATE/quiet && touch ~/$REMOTE_STATE/quiet/$(q "$uuid")" 2>/dev/null
+    # A worktree the session worked in may be gone by now (removed once its PR
+    # merged): come back in the checkout it belonged to.
+    base="${dir%%/.claude/worktrees/*}"
+    new_id="$(ssh "$HOST" "${RPATH}{ cd $(q "$dir") 2>/dev/null || cd $(q "$base"); } && claude --bg --resume $(q "$uuid") $(q "$(restart_note "$how")")" 2>/dev/null | bg_id)"
+    [ -n "$new_id" ] || die "could not resume $cc_id ($uuid)"
+
+    # Right after the old pane while it is still open, else where it was.
+    if [ -n "$old" ] && pane_exists "$old"; then
+        open_pane "$new_id" "$(basename "$dir")" --after "$old"
+        "$AGTERMCTL" session close --target "$old" >/dev/null 2>&1
+    else
+        open_pane "$new_id" "$(basename "$dir")" "${place[@]+"${place[@]}"}"
+    fi
+}
+
+open_pane() {
+    # Use Claude Code's own session name. Its OSC title does not survive
+    # `claude attach` (the fullscreen renderer emits none), so an unnamed pane
+    # would read the ssh command. cc-remote-bridge re-syncs the label once
+    # Claude renames the session after the first prompt.
+    # Further args, optional, place the pane (--after/--before <pane>,
+    # --workspace <id>): where the one a restart replaces was.
+    local cc_id="$1" label="$2" pane_id cc_name cmd place=("${@:3}")
+    cc_name="$(ssh "$HOST" "${RPATH}claude agents --json --all" 2>/dev/null |
+                jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .name // empty' | head -1)"
+    [ -n "$cc_name" ] && [ "$cc_name" != "$cc_id" ] || cc_name="$label"
+    # "⧉ ✳ " marks a remote Claude pane. See the bridge's sync_names for why the
+    # glyph is static rather than the animated one Claude puts in its OSC title.
+    cc_name="${cc_name#[✳◐◑◒◓✶✻✽*] }"
+    case "$cc_name" in "⧉ "*) ;; *) cc_name="⧉ ✳ $cc_name" ;; esac
+
+    cmd="$(pane_cmd "claude attach $(q "$cc_id")")"
+    pane_id="$("$AGTERMCTL" session new \
+        --name "$cc_name" "${place[@]+"${place[@]}"}" \
+        --command "$cmd" --wait \
+        --json 2>/dev/null | jq -r '.result.id // empty')"
+    [ -n "$pane_id" ] || die "could not create an agterm session (is agterm running?)"
+
+    register "$cc_id" "$pane_id"
+    "$AGTERMCTL" session restore "$cmd" --target "$pane_id" >/dev/null 2>&1
+    echo "attached $cc_id in agterm session $pane_id"
+}
+
+need_absolute() {
+    case "$1" in /*) ;; *) die "remote path must be absolute: $1" ;; esac
+}
+
+case "${1:-}" in
+    --shell)
+        # A plain login shell on the server. The pane keeps following the remote
+        # shell's OSC title (marked "⧉" by the snippet install.sh adds to the
+        # remote ~/.bashrc), so it stays dynamic. CC_REMOTE_PANE rides along, so
+        # a claude started by hand in that shell still reports to this pane.
+        dir="${2:-}"
+        [ -n "$dir" ] || dir="$(pick_dir "new $NAME shell session in…")"
+        [ -n "$dir" ] || { echo "cancelled" >&2; exit 0; }
+        need_absolute "$dir"
+
+        cmd="$(pane_cmd --pane "cd $(q "$dir") && exec \"\$SHELL\" -l")"
+        pane_id="$("$AGTERMCTL" session new --command "$cmd" --wait --json 2>/dev/null |
+                   jq -r '.result.id // empty')"
+        [ -n "$pane_id" ] || die "could not create an agterm session (is agterm running?)"
+        "$AGTERMCTL" session restore "$cmd" --target "$pane_id" >/dev/null 2>&1
+        echo "ssh session in $dir (pane $pane_id)"
+        ;;
+    --stop-pane)
+        # Bound to a chord inside an attached pane: stop the Claude session this
+        # pane shows and close the pane. The pane id comes from the custom
+        # command's $AGT_SESSION_ID (or the shell's $AGTERM_SESSION_ID), and the
+        # bridge map resolves it back to the background id. A pane opened by
+        # --direct or --shell has no background id, so it is refused rather than
+        # guessed at.
+        pane="${2:-${AGT_SESSION_ID:-${AGTERM_SESSION_ID:-}}}"
+        [ -n "$pane" ] || die "no agterm pane id (run from a chord, or pass the pane id)"
+        cc_id="$(jq -r --arg p "$pane" 'to_entries[] | select(.value == $p) | .key | select(test("^[0-9a-f]{8}$"))' "$MAP" 2>/dev/null | head -1)"
+        [ -n "$cc_id" ] || die "this pane is not an attached $NAME Claude Code session"
+        sessions="$(remote_sessions)"
+        row="$(jq -c --arg i "$cc_id" '.[] | select(.id == $i)' <<<"$sessions" | head -1)"
+        [ -n "$row" ] || die "session $cc_id is not running on $HOST"
+        name="$(jq -r '.name // empty' <<<"$row")"
+        dir="$(jq -r '.cwd // empty' <<<"$row")"
+        info="$(cleanup_info "$dir")"
+
+        # Cancel first: this chord is destructive, so a stray Enter does nothing.
+        confirm="$({ jq -nc '{id: "cancel", label: "cancel"}'
+                     jq -nc '{id: "restart", label: "restart", subtitle: "Claude is told, and starts again the shells, monitors and agents it had running"}'
+                     jq -nc --arg d "$dir" '{id: "stop", label: "stop and close this pane", subtitle: $d}'
+                     cleanup_row "$info" stop; } | jq -s -c . |
+                   "$AGTERMCTL" pick --prompt "stop \"$name\"?" 2>/dev/null |
+                   jq -r 'select(.result == "picked") | .id // empty')"
+        case "$confirm" in
+            restart) restart_session "$cc_id" "$(jq -r '.sessionId' <<<"$row")" "$dir" restarted ;;
+            stop) kill_session "$cc_id" ;;
+            cleanup) kill_session "$cc_id"; do_cleanup "$info" ;;
+            *) echo "cancelled" >&2; exit 0 ;;
+        esac
+        ;;
+    --kill)
+        # Running sessions only: background ones (stopped by id, resumable
+        # later) and the remote-control servers' own interactive sessions (no
+        # id, so killed by pid). Sessions the phone spawned INSIDE an rc server
+        # live in that server's process and appear only in the Claude app.
+        sessions="$(remote_sessions)"
+        items="$(picker_rows <<<"$sessions" 2>/dev/null)"
+        [ "$(jq -r 'length' <<<"$items" 2>/dev/null)" != "0" ] || die "no running sessions on $HOST"
+
+        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "kill which $NAME Claude Code session?" 2>/dev/null |
+                  jq -r 'select(.result == "picked") | .id // empty')"
+        [ -n "$choice" ] || { echo "cancelled" >&2; exit 0; }
+
+        target="${choice#*:}"
+        if [ "${choice%%:*}" = "app" ]; then
+            row="$(jq -c --arg s "$target" '.[] | select(.sessionId == $s)' <<<"$sessions")"
+            label="app session $(jq -r '.name' <<<"$row")"
+        else
+            label="$(jq -r --arg i "$target" '.[] | select(.id == $i) | .name' <<<"$sessions")"
+        fi
+
+        confirm="$(printf '%s\n' "cancel" "kill $label" |
+                   "$AGTERMCTL" pick --prompt "confirm" 2>/dev/null |
+                   jq -r 'select(.result == "picked") | .id // empty')"
+        case "$confirm" in kill*) ;; *) echo "cancelled" >&2; exit 0 ;; esac
+
+        if [ "${choice%%:*}" = "app" ]; then
+            # The rc server stays up and will make a new session on demand.
+            pid="$(jq -r '.pid // empty' <<<"$row")"
+            case "$pid" in ''|*[!0-9]*) die "no process id for $label" ;; esac
+            ssh "$HOST" "kill $pid" 2>&1 | tail -1
+            echo "killed $label"
+        else
+            kill_session "$target"
+        fi
+        ;;
+    --restart)
+        # What the pickers' "restart" does, without a picker: for a script, or a
+        # session that should come back after a plugin or settings change.
+        cc_id="${2:?usage: cc-remote-attach --restart <id>}"
+        row="$(remote_sessions | jq -c --arg i "$cc_id" '.[] | select(.id == $i)' | head -1)"
+        [ -n "$row" ] || die "session $cc_id is not running on $HOST"
+        restart_session "$cc_id" "$(jq -r '.sessionId' <<<"$row")" "$(jq -r '.cwd' <<<"$row")" restarted
+        ;;
+    --list)
+        ssh "$HOST" "${RPATH}claude agents --json --all" 2>/dev/null |
+            jq -r '.[] | "\(.id // "-")\t\(.kind)\t\(.state // .status // "-")\t\(.name)\t\(.cwd)"'
+        exit 0
+        ;;
+    --direct)
+        # A DIRECT session, wrapped in tmux on the server. `claude --bg` plus
+        # `claude attach` always renders fullscreen; a direct `claude` honours
+        # the `tui: default` setting, and tmux keeps it alive when the pane closes.
+        dir="${2:?usage: cc-remote-attach --direct <remote-dir>}"
+        need_absolute "$dir"
+        slug="cc-$(basename "$dir" | tr -c 'A-Za-z0-9_-' '-')"
+        t0="$(date +%s)000"
+
+        cmd="$(pane_cmd "tmux new -A -s $(q "$slug") -c $(q "$dir") claude")"
+        pane_id="$("$AGTERMCTL" session new --command "$cmd" --wait \
+            --json 2>/dev/null | jq -r '.result.id // empty')"
+        [ -n "$pane_id" ] || die "could not create an agterm session (is agterm running?)"
+        "$AGTERMCTL" session restore "$cmd" --target "$pane_id" >/dev/null 2>&1
+
+        # The session id only exists once claude is up; poll for it, then map it.
+        uuid=""
+        for _ in $(seq 1 20); do
+            sleep 1
+            uuid="$(remote_sessions | jq -r --arg d "$dir" --argjson t "$t0" \
+                '[.[] | select(.kind == "interactive" and .cwd == $d and .startedAt >= $t)]
+                 | sort_by(.startedAt) | last | .sessionId // empty')"
+            [ -n "$uuid" ] && break
+        done
+
+        if [ -n "$uuid" ]; then
+            tmp="$(mktemp)"
+            jq --arg u "$uuid" --arg t "$pane_id" '.[$u] = $t' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+            echo "started $slug ($uuid) in agterm session $pane_id"
+        else
+            echo "pane $pane_id opened, but no session id appeared — status glyphs will not track it" >&2
+        fi
+        ;;
+    --new)
+        # The durable, `claude agents`-managed variant. Fullscreen while attached.
+        # With no directory, pick one, with a typed path as the fallback.
+        dir="${2:-}"
+        [ -n "$dir" ] || dir="$(pick_dir "new $NAME Claude Code session in…")"
+        [ -n "$dir" ] || { echo "cancelled" >&2; exit 0; }
+        need_absolute "$dir"
+        cc_id="$(ssh "$HOST" "${RPATH}cd $(q "$dir") && claude --bg" 2>/dev/null | bg_id)"
+        [ -n "$cc_id" ] || die "could not start a background session in $dir"
+        open_pane "$cc_id" "$(basename "$dir")"
+        ;;
+    "")
+        # Pick a session, then pick what to do with it. Background sessions are
+        # attached by id; an app-started one is taken over first (see
+        # takeover_pane) because `claude attach` needs a background id.
+        sessions="$(all_sessions)"
+        items="$(picker_rows <<<"$sessions" 2>/dev/null)"
+        if [ "$(jq -r 'length' <<<"$items")" = "0" ]; then
+            die "no sessions on $HOST"
+        fi
+        # pick prints {"id":…,"result":"picked","label":…}; `result` is a string,
+        # so index only `.id`, and treat anything but "picked" as a cancel.
+        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "$NAME Claude Code sessions" 2>/dev/null |
+                  jq -r 'select(.result == "picked") | .id // empty')"
+        [ -n "$choice" ] && [ "$choice" != "$SEP_ID" ] || { echo "cancelled" >&2; exit 0; }
+
+        kind="${choice%%:*}"
+        target="${choice#*:}"
+        info='{"kind":"none"}'
+        if [ "$kind" = "app" ]; then
+            row="$(jq -c --arg s "$target" '.[] | select(.sessionId == $s)' <<<"$sessions")"
+            actions=("attach (takes it over from the app)" "kill" "cancel")
+        else
+            row="$(jq -c --arg i "$target" '.[] | select(.id == $i)' <<<"$sessions")"
+            info="$(cleanup_info "$(jq -r '.cwd' <<<"$row")")"
+            # A stopped session has no process to kill; it is resumed instead.
+            if [ "$(jq -r 'has("pid")' <<<"$row")" != "true" ]; then
+                actions=("resume" "@cleanup:" "cancel")
+            else
+                actions=("attach" "restart" "kill" "@cleanup:kill" "cancel")
+            fi
+        fi
+        name="$(jq -r '.name' <<<"$row")"
+        dir="$(jq -r '.cwd' <<<"$row")"
+
+        # Attach first, so a stray Enter does the safe thing. agterm has no "back"
+        # into a previous picker, so the last option just cancels. "@cleanup:<verb>"
+        # stands for the clean-up row, left out when there is nothing to clean up.
+        action="$(action_items "$info" "${actions[@]}" |
+                  "$AGTERMCTL" pick --prompt "$name" 2>/dev/null |
+                  jq -r 'select(.result == "picked") | .id // empty')"
+
+        case "$action" in
+            attach*)
+                if [ "$kind" = "app" ]; then
+                    takeover_pane "$target" "$dir" "$(jq -r '.pid' <<<"$row")"
+                else
+                    open_pane "$target" "$(basename "$dir")"
+                fi
+                ;;
+            # A stopped session took its shells, monitors and agents with it, so it
+            # comes back through `claude --bg --resume` with the note rather than a
+            # bare `claude attach`. That also brings back one that crashed (state
+            # "failed"), which `claude attach` would only show its crash message.
+            resume) restart_session "$target" "$(jq -r '.sessionId' <<<"$row")" "$dir" resumed ;;
+            restart) restart_session "$target" "$(jq -r '.sessionId' <<<"$row")" "$dir" restarted ;;
+            kill)
+                if [ "$kind" = "app" ]; then
+                    pid="$(jq -r '.pid // empty' <<<"$row")"
+                    case "$pid" in ''|*[!0-9]*) die "no process id for app session $name" ;; esac
+                    ssh "$HOST" "kill $pid" >/dev/null 2>&1
+                    echo "killed app session $name"
+                else
+                    kill_session "$target"
+                fi
+                ;;
+            cleanup)
+                [ "$(jq -r 'has("pid")' <<<"$row")" = "true" ] && kill_session "$target"
+                do_cleanup "$info"
+                ;;
+            *) echo "cancelled" >&2; exit 0 ;;
+        esac
+        ;;
+    -h|--help)
+        sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    -*)
+        die "unknown option: $1 (see --help)"
+        ;;
+    *)
+        cc_id="$1"
+        label="$(remote_sessions | jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .cwd' | xargs basename 2>/dev/null)"
+        open_pane "$cc_id" "${label:-$cc_id}"
+        ;;
+esac

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Mac side of the agterm status bridge, run by launchd (cc-agterm-remote.bridge).
+#
+# Tails the server's ~/.cache/cc-agterm-remote/status.jsonl, which the
+# cc-remote-status hook appends to, over one persistent ssh connection, and
+# paints the agterm agent-status glyph on whichever local pane is showing that
+# remote session. The pane mapping is written by `cc-remote-attach`.
+#
+# The same connection carries the Mac clipboard and link opening to the server:
+# it forwards the server's ~/.cache/cc-agterm-remote/clipboard.sock to the
+# local socket cc-remote-clipboard answers on (see there).
+#
+#   cc-remote-bridge          run in the foreground (Ctrl+C to stop)
+#   cc-remote-bridge --once   print the configuration and pane map, then exit
+#
+# Why a journal instead of forwarding AGTERM_* over ssh: a phone-started session
+# and a `claude --bg` daemon have no AGTERM_* at all, and a daemon keeps the env
+# of whatever pane spawned it. Mapping on this side is the only thing that
+# survives detach and reattach.
+set -uo pipefail
+# shellcheck source=cc-remote-config
+. "$(dirname "$0")/cc-remote-config"
+need_host
+
+LIVE="$STATE/live-panes.json"
+
+mkdir -p "$STATE"
+[ -f "$MAP" ] || printf '{}\n' > "$MAP"
+printf '{}\n' > "$LIVE"
+
+paint() {
+    local sid="$1" state="$2" target="${3:-}" tmp
+    # A pane the hook reported itself (CC_REMOTE_PANE, set in plain ssh panes)
+    # wins — that is how a claude started BY HAND inside an ssh session, which
+    # appears in no map, still lights up. Otherwise look the session up: exact
+    # key first, then the 8-char short id, which is the UUID's first block.
+    if [ -z "$target" ]; then
+        target="$(jq -r --arg s "$sid" '.[$s] // empty' "$MAP" 2>/dev/null)"
+    fi
+    if [ -z "$target" ]; then
+        target="$(jq -r --arg s "${sid:0:8}" '.[$s] // empty' "$MAP" 2>/dev/null)"
+    fi
+    [ -n "$target" ] || return 0
+
+    # Remember pane-reported sessions (a claude started by hand in an ssh pane)
+    # so sync_names can mark the pane while it runs and un-mark it when it exits.
+    if [ -n "${3:-}" ]; then
+        tmp="$(mktemp)"
+        jq --arg s "$sid" --arg p "$target" '. + {($s): $p}' "$LIVE" > "$tmp" 2>/dev/null && mv "$tmp" "$LIVE"
+    fi
+
+    case "$state" in
+        # Same flags the local agterm hooks use, so remote panes behave identically.
+        blocked)   "$AGTERMCTL" session status blocked   --target "$target" --blink >/dev/null 2>&1 ;;
+        completed) "$AGTERMCTL" session status completed --target "$target" --auto-reset >/dev/null 2>&1 ;;
+        active)    "$AGTERMCTL" session status active    --target "$target" --blink >/dev/null 2>&1 ;;
+        idle)      "$AGTERMCTL" session status idle      --target "$target" >/dev/null 2>&1 ;;
+    esac
+}
+
+if [ "${1:-}" = "--once" ]; then
+    echo "config:    $CC_REMOTE_CONFIG"
+    echo "host:      $HOST"
+    echo "agtermctl: $AGTERMCTL"
+    echo "map:       $MAP ($(jq -r 'length' "$MAP" 2>/dev/null) entries)"
+    jq -r 'to_entries[] | "  \(.key) -> \(.value)"' "$MAP" 2>/dev/null
+    exit 0
+fi
+
+echo "bridging $HOST:~/$REMOTE_STATE/status.jsonl -> agterm (map: $MAP)"
+
+# "⧉ ✳ <name>": a static "✳" marks the pane as Claude, "⧉" as remote. agterm
+# normally names a pane from its OSC title, which Claude writes as "<animated
+# glyph> <name>"; an explicitly named pane stops following the title, so the
+# glyph would freeze mid-animation.
+pane_label() {
+    local name="${1#[✳◐◑◒◓✶✻✽*] }"
+    case "$name" in "⧉ "*) printf '%s' "$name" ;; *) printf '⧉ ✳ %s' "$name" ;; esac
+}
+
+# Claude Code names a session itself after the first prompt, and that name never
+# reaches the terminal title through `claude attach`. Poll for it and relabel the
+# pane so the sidebar shows Claude's name rather than the one set at launch.
+sync_names() {
+    local agents sid pane name tmp
+    while :; do
+        sleep 60
+        agents="$(ssh "$HOST" 'export PATH="$HOME/.local/bin:$PATH"; claude agents --json' 2>/dev/null)" || continue
+        [ -n "$agents" ] || continue
+        while IFS=$'\t' read -r sid pane; do
+            [ -n "$sid" ] && [ -n "$pane" ] || continue
+            name="$(jq -r --arg s "$sid" \
+                '.[] | select(.sessionId == $s or .id == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
+            [ -n "$name" ] && [ "$name" != "$sid" ] || continue
+            "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
+        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$MAP" 2>/dev/null)
+
+        # Panes running a hand-started claude: Claude Code overwrites the shell's
+        # OSC title with its own "✳ <name>", losing the remote mark. Re-mark them
+        # while the session lives, and un-name the pane once it is gone so it
+        # goes back to following the shell title ("⧉ ~/dir").
+        while IFS=$'\t' read -r sid pane; do
+            [ -n "$sid" ] && [ -n "$pane" ] || continue
+            name="$(jq -r --arg s "$sid" \
+                '.[] | select(.sessionId == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
+            if [ -n "$name" ]; then
+                "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
+            else
+                "$AGTERMCTL" session rename "" --target "$pane" >/dev/null 2>&1
+                tmp="$(mktemp)"
+                jq --arg s "$sid" 'del(.[$s])' "$LIVE" > "$tmp" 2>/dev/null && mv "$tmp" "$LIVE"
+            fi
+        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$LIVE" 2>/dev/null)
+    done
+}
+sync_names &
+trap 'kill %1 2>/dev/null' EXIT
+
+while :; do
+    # Each connection first makes the server's directory (owner only) and clears
+    # a socket a dropped connection left, which would make the forward fail:
+    # sshd removes a stale socket only with StreamLocalBindUnlink, off by
+    # default. It also learns the remote home, since a forwarded socket path
+    # must be absolute.
+    rhome="$(ssh -o ConnectTimeout=10 "$HOST" \
+        "mkdir -p ~/$REMOTE_STATE && chmod 700 ~/$REMOTE_STATE && rm -f ~/$REMOTE_STATE/clipboard.sock && printf %s \"\$HOME\"" 2>/dev/null)"
+    if [ -n "$rhome" ]; then
+        forward=(-R "$rhome/$REMOTE_STATE/clipboard.sock:$CLIPBOARD_SOCK")
+        # A failed forward (the socket in use) only loses the clipboard; the
+        # status tail keeps running.
+        ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=no \
+            "${forward[@]}" "$HOST" \
+            "touch ~/$REMOTE_STATE/status.jsonl; tail -F -n0 ~/$REMOTE_STATE/status.jsonl" 2>/dev/null |
+        while IFS= read -r line; do
+            sid="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
+            state="$(jq -r '.state // empty' <<<"$line" 2>/dev/null)"
+            pane="$(jq -r '.pane // empty' <<<"$line" 2>/dev/null)"
+            [ -n "$sid" ] && [ -n "$state" ] && paint "$sid" "$state" "$pane"
+        done
+    fi
+    echo "connection dropped, reconnecting in 10s" >&2
+    sleep 10
+done

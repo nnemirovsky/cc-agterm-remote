@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly check for Claude Code remote-control servers on a stale build
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

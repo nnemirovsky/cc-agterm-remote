@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Render an image in an agterm overlay, whether the file is on the Mac or on the server.
+#
+#   cc-remote-show-image <path> [size-percent]   explicit path, local or remote
+#   cc-remote-show-image                         use the pane selection ($AGT_SELECTION)
+#
+# Why this exists: agterm renders images natively through the kitty graphics protocol, but only
+# from inside an overlay — a coding agent cannot print the escapes to its own tool stdout (the
+# harness escapes the control bytes) and cannot run a viewer in its tool shell (no tty). The
+# bundled scripts/show-image.sh opens that overlay, but it is Mac-side: it needs agtermctl and
+# `sips`, neither of which exists on the server. The overlay always runs on the Mac anyway, so a
+# remote image only needs its bytes fetched first. That is the whole job here.
+#
+# Do NOT patch the bundled show-image.sh instead. It ships with the agterm app (Help > Install
+# Agent Skill) and an app update overwrites it.
+set -uo pipefail
+
+# shellcheck source=cc-remote-config
+. "$(dirname "$0")/cc-remote-config"
+need_host
+
+# A detached keymap command inherits none of the session's agterm environment, only the AGT_*
+# tokens. The bundled script gates on AGTERM_ENABLED and agtermctl resolves the socket from
+# AGTERM_SOCKET, so bridge one to the other when running from a chord.
+[ -n "${AGT_SOCKET:-}" ] && export AGTERM_SOCKET="$AGT_SOCKET"
+[ -n "${AGT_SESSION_ID:-}" ] && export AGTERM_SESSION_ID="$AGT_SESSION_ID"
+[ -n "${AGT_SOCKET:-}${AGTERM_SOCKET:-}" ] && export AGTERM_ENABLED=1
+
+# A keymap command runs DETACHED with no terminal, so anything on stderr is invisible. Report
+# through agterm itself or a failure looks like the chord doing nothing at all.
+fail() {
+    echo "cc-remote-show-image: $1" >&2
+    command -v agtermctl >/dev/null 2>&1 && agtermctl notify "show image" --detail "$1" >/dev/null 2>&1
+    exit "${2:-1}"
+}
+
+# Path sources, in order. AGT_SELECTION is agterm's OWN selection and is empty whenever Claude
+# Code is in fullscreen: it captures the mouse and keeps the selection internally, so the
+# terminal never sees one. Claude Code does copy it to the system clipboard on mouse release
+# (over SSH via OSC 52), which is why the clipboard is the fallback that actually works.
+raw="${1:-}"
+[ -n "$raw" ] || raw="${AGT_SELECTION:-}"
+[ -n "$raw" ] || raw="$(pbpaste 2>/dev/null)"
+size="${2:-60}"
+[ -n "$raw" ] || fail "no path given, no selection, and the clipboard holds no text (an image on the clipboard reads as empty)" 2
+
+# The selection is usually grabbed off a Claude Code line like
+#   > [image] ~/hub-screenshots/volume-factor/03-edit-modal-factor-10.png (86.6KB)
+# complete with a leading tree glyph and a trailing size. Rather than stripping each piece of
+# decoration (a losing game against glyphs that change), pull out the first token that LOOKS
+# like a path: one starting with ~, / or . and running to whitespace.
+# An image file name first, whole (assets/x.png included, which the anchored match below would
+# cut down to /x.png); then anything that looks like a path.
+path=$(printf '%s' "$raw" | tr -d '\r' | grep -oiE '[^[:space:]]*\.(png|jpe?g|gif|webp)' | head -1)
+[ -n "$path" ] || path=$(printf '%s' "$raw" | tr -d '\r' | grep -o '[~/.][^[:space:]]*' | head -1)
+if [ -z "$path" ]; then
+    # No anchored path, so fall back to the last bare token and let the existence checks judge it.
+    path=$(printf '%s' "$raw" | tr -d '\r' \
+        | sed -e 's/[[:space:]]*([0-9.]*[KMG]*B)[[:space:]]*$//' -e 's/.*[[:space:]]//' \
+              -e 's/^["'"'"']//' -e 's/["'"'"']$//')
+fi
+[ -n "$path" ] || fail "nothing that looks like a path in: $(printf '%.60s' "$raw")" 2
+
+# Locate the bundled renderer. It lives in the installed skill or in a plugin cache.
+finder=""
+for c in "$HOME/.claude/skills/agterm/scripts/show-image.sh" \
+         "$HOME/.codex/skills/agterm/scripts/show-image.sh" \
+         "$HOME"/.claude/plugins/cache/*/agterm/*/scripts/show-image.sh \
+         "$HOME"/.codex/plugins/cache/*/agterm/*/scripts/show-image.sh; do
+    [ -f "$c" ] && { finder="$c"; break; }
+done
+[ -n "$finder" ] || fail "agterm's show-image.sh not found; install the agterm skill"
+
+# First choice: hand the path to the inline-images Claude Code mod running in this pane's
+# session, which draws it in a pane inside Claude Code, reading the file where the session
+# runs. A remote image then reaches the terminal inside the ssh stream, no copy. The mod
+# polls ~/.cache/inline-images/inbox/<name> once a second and empties the file when it
+# takes the request; a file still full after a few seconds means no mod is listening,
+# and the overlay below takes over.
+INBOX=".cache/inline-images/inbox"
+remote_session=""
+if [ -n "${AGT_SESSION_ID:-}" ] && [ -f "$MAP" ]; then
+    # The bridge's map holds both the short and the full session id per pane; take the full.
+    remote_session=$(jq -r --arg p "$AGT_SESSION_ID" \
+        'to_entries[] | select(.value == $p and (.key | length) == 36) | .key' \
+        "$MAP" 2>/dev/null | head -1)
+fi
+if [ -n "$remote_session" ]; then
+    case "$path" in "$HOST":*) want="${path#*:}" ;; *) want="$path" ;; esac
+    if ssh "$HOST" "mkdir -p ~/$INBOX && cat > ~/$INBOX/$remote_session && sleep 3 && test ! -s ~/$INBOX/$remote_session" \
+        <<<"$want" 2>/dev/null; then
+        exit 0
+    fi
+    ssh "$HOST" ": > ~/$INBOX/$remote_session" 2>/dev/null
+elif [ -n "${AGT_SESSION_ID:-}" ]; then
+    mkdir -p "$HOME/$INBOX"
+    printf '%s' "$path" > "$HOME/$INBOX/$AGT_SESSION_ID"
+    for _ in 1 2 3 4; do
+        sleep 0.5
+        [ -s "$HOME/$INBOX/$AGT_SESSION_ID" ] || exit 0
+    done
+    : > "$HOME/$INBOX/$AGT_SESSION_ID"
+fi
+
+local_path=""
+case "$path" in
+    "$HOST":*) remote="${path#*:}" ;;                        # explicit host:/path
+    /*|"~"/*|"~")
+        expanded="${path/#\~/$HOME}"
+        [ -f "$expanded" ] && local_path="$expanded" || remote="$path"
+        ;;
+    *)
+        [ -f "$path" ] && local_path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")" || remote="$path"
+        ;;
+esac
+
+if [ -z "$local_path" ]; then
+    # Not on this machine. Pull it from the server, keeping the basename so the overlay's
+    # "press Enter to close" prompt still sits under a recognisable file.
+    remote="${remote:-$path}"
+    # A cache dir rather than a per-run temp: the overlay reads the file AFTER this script
+    # exits, so nothing here may delete it on the way out, and `exec` below would discard an
+    # EXIT trap anyway. Old copies are pruned on the next run instead.
+    cache="${TMPDIR:-/tmp}/cc-remote-show-image"
+    mkdir -p "$cache" || exit 1
+    find "$cache" -type f -mtime +1 -delete 2>/dev/null
+    dest="$cache/$(basename "$remote")"
+    if ! scp -q "$HOST:$remote" "$dest" 2>/dev/null; then
+        fail "not on this Mac, and $HOST:$remote is not readable either"
+    fi
+    local_path="$dest"
+fi
+
+exec bash "$finder" "$local_path" "$size"

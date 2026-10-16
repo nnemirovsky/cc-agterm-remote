@@ -1,0 +1,13 @@
+{
+  "name": "rename-session",
+  "version": "0.1.0",
+  "description": "Gives Claude a tool to rename its own Claude Code session, through the real /rename",
+  "author": {
+    "name": "Nikita Nemirovsky",
+    "url": "https://github.com/nnemirovsky"
+  },
+  "homepage": "https://github.com/nnemirovsky/cc-agterm-remote",
+  "repository": "https://github.com/nnemirovsky/cc-agterm-remote",
+  "license": "MIT",
+  "keywords": ["session", "rename", "mod", "function-hooks"]
+}

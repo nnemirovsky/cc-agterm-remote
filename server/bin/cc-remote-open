@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# BROWSER on the server: opens a link on the Mac. Claude Code opens a link
+# clicked in a fullscreen session (every `claude attach`) itself, with
+# "$BROWSER <url>" in the attach client; the server has no browser or display,
+# so without this a click does nothing. Asks cc-remote-clipboard on the Mac to
+# `open` it, through the socket cc-remote-bridge forwards (see cc-remote-talk).
+# Only http(s) URLs. With the bridge down it says so and exits 0 at once, so a
+# caller waiting on the browser never hangs.
+# shellcheck source=cc-remote-talk
+. "$(dirname "$0")/cc-remote-talk"
+url="${1:-}"
+case "$url" in
+    http://*|https://*) ;;
+    *) echo "cc-remote-open: only http(s) URLs: $url" >&2; exit 1 ;;
+esac
+case "$url" in
+    *[[:space:][:cntrl:]]*) echo "cc-remote-open: URL has whitespace or control characters" >&2; exit 1 ;;
+esac
+printf 'open %s\n' "$url" | talk >/dev/null ||
+    echo "cc-remote-open: the bridge to the Mac is down, open it yourself: $url" >&2
+exit 0

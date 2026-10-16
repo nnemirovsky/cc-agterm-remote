@@ -1,0 +1,14 @@
+{
+  "name": "cc-agterm-remote",
+  "description": "Claude Code plugins that ship with cc-agterm-remote",
+  "owner": {
+    "name": "nnemirovsky"
+  },
+  "plugins": [
+    {
+      "name": "rename-session",
+      "source": "./plugin/rename-session",
+      "description": "Gives Claude a tool to rename its own Claude Code session, through the real /rename"
+    }
+  ]
+}

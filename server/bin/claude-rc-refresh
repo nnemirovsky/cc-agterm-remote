@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Restart Claude Code remote-control servers that still run an older build than
+# ~/.local/bin/claude points at. Run hourly by claude-rc-refresh.timer.
+#
+# Why this is needed: the native updater re-points the ~/.local/bin/claude
+# symlink, and the background daemon notices and restarts itself, but a
+# long-lived `claude remote-control` process keeps running the binary it
+# started with. Left alone it drifts for weeks, loses access to newer models,
+# and dies when its server credential expires about 30 days after start.
+#
+# It finds the servers itself: every `claude remote-control` process of yours,
+# whatever unit it runs in (claude-rc@<name>, or one you wrote by hand), found
+# through its cgroup. A server running outside systemd is reported as an
+# orphan and left alone: it keeps registering its directory, so the app lists
+# that directory twice, and it ignores SIGTERM (kill -9 it).
+#
+# `systemctl restart` kills the unit's whole cgroup, and Remote Control spawns
+# its sessions as children, so a restart takes every attached session with it.
+# A unit is therefore only restarted once each session it hosts has been quiet
+# for at least RC_IDLE_HOURS.
+#
+#   RC_IDLE_HOURS=8   quiet period required before a hosted session may be dropped
+#   RC_FORCE=1        restart regardless of session activity
+#   DRY_RUN=1         report what would happen, change nothing
+set -uo pipefail
+
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+IDLE_HOURS="${RC_IDLE_HOURS:-8}"
+FORCE="${RC_FORCE:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+
+current=$(readlink -f "$CLAUDE_BIN") || { echo "cannot resolve $CLAUDE_BIN"; exit 1; }
+now=$(date +%s)
+agents_json=$("$CLAUDE_BIN" agents --json 2>/dev/null) || agents_json='[]'
+[[ -n $agents_json ]] || agents_json='[]'
+
+# Last real conversation entry for a session, as epoch seconds. Transcript
+# mtime is not usable here: the daemon touches idle transcripts, so a session
+# untouched for 12h can still look fresh on disk.
+last_activity() {
+  local sid=$1 pid=$2 file ts epoch
+  file=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sid.jsonl" -print -quit 2>/dev/null)
+  if [[ -n $file ]]; then
+    ts=$(tail -c 262144 "$file" | grep -ao '"timestamp":"[^"]*"' | tail -1 | cut -d'"' -f4)
+    if [[ -n $ts ]] && epoch=$(date -d "$ts" +%s 2>/dev/null); then
+      echo "$epoch"
+      return
+    fi
+  fi
+  # No transcript yet: fall back to how long the session process has been up.
+  if ts=$(ps -o lstart= -p "$pid" 2>/dev/null) && epoch=$(date -d "$ts" +%s 2>/dev/null); then
+    echo "$epoch"
+    return
+  fi
+  echo 0
+}
+
+# The user unit a process runs in, from its cgroup (…/app.slice/<unit>.service),
+# or nothing when it runs in a login session's scope instead.
+unit_of() {
+  sed -n 's|.*/\([^/]*\.service\)$|\1|p' "/proc/$1/cgroup" 2>/dev/null | head -1
+}
+
+# Every remote-control server of this user, as "unit pid" (pid 0 marks one
+# outside any unit, whose unit field is then "-").
+declare -A seen=()
+servers=()
+for pid in $(pgrep -u "$(id -u)" -f 'claude remote-control' 2>/dev/null); do
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+  # Only Claude Code itself: a shell whose command line merely mentions it
+  # (pgrep run from one, say) matches the pattern too.
+  case "$exe" in *claude*) ;; *) continue ;; esac
+  unit=$(unit_of "$pid")
+  if [[ -z $unit || $unit == user@*.service ]]; then
+    echo "orphan: pid $pid runs claude remote-control outside systemd ($(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)) — kill -9 it if unwanted"
+    continue
+  fi
+  [[ -n ${seen[$unit]:-} ]] && continue
+  seen[$unit]=1
+  servers+=("$unit $pid")
+done
+
+(( ${#servers[@]} )) || { echo "no remote-control servers running"; exit 0; }
+
+for entry in "${servers[@]}"; do
+  unit=${entry% *} rc_pid=${entry#* }
+  running=$(readlink -f "/proc/$rc_pid/exe" 2>/dev/null)
+  if [[ -z $running ]]; then
+    echo "$unit: cannot read /proc/$rc_pid/exe, skipped"
+    continue
+  fi
+  if [[ $running == "$current" ]]; then
+    echo "$unit: current ($(basename "$current"))"
+    continue
+  fi
+
+  defer=0
+  if (( ! FORCE )); then
+    while read -r pid sid; do
+      [[ -n ${pid:-} && -n ${sid:-} ]] || continue
+      [[ $(unit_of "$pid") == "$unit" ]] || continue
+      la=$(last_activity "$sid" "$pid")
+      idle_h=$(( (now - la) / 3600 ))
+      if (( la == 0 || idle_h < IDLE_HOURS )); then
+        echo "$unit: hosting $sid, quiet for ${idle_h}h (need ${IDLE_HOURS}h) — deferring"
+        defer=1
+      else
+        echo "$unit: hosting $sid, quiet for ${idle_h}h — droppable"
+      fi
+    done < <(jq -r '.[] | select(.kind == "interactive") | "\(.pid) \(.sessionId)"' <<<"$agents_json")
+  fi
+  (( defer )) && continue
+
+  echo "$unit: $(basename "$running") -> $(basename "$current"), restarting"
+  (( DRY_RUN )) || systemctl --user restart "$unit"
+done

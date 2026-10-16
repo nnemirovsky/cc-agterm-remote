@@ -1,0 +1,75 @@
+#!/bin/bash
+# Serve the Mac clipboard and link opening to Claude Code sessions on the
+# server, one request per connection. launchd runs this inetd-style
+# (cc-agterm-remote.clipboard) on ~/.config/cc-agterm-remote/clipboard.sock, a
+# socket only you can open, with the connection on stdin/stdout.
+# cc-remote-bridge forwards it to the server's
+# ~/.cache/cc-agterm-remote/clipboard.sock (owner only too), where the xclip
+# stand-in and cc-remote-open ask it for what Claude Code wants.
+#
+# Requests, one line:
+#   targets      print image/png when the clipboard holds an image, else nothing
+#   image/png    print the clipboard image as PNG
+#   copy         put the rest of the connection on the clipboard as text
+#   open <url>   open an http(s) URL in the default browser (the server's
+#                BROWSER, cc-remote-open, for links clicked in Claude Code)
+#
+# Plain /bin/bash 3.2 and osascript only, nothing installed. Image order as in
+# cc-remote-paste-image: a Finder-copied image file, then PNG, then TIFF via sips.
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+IFS= read -r -t 5 req || exit 0
+req="${req%$'\r'}"
+
+image_file() {  # print the path of a PNG of the clipboard image, or fail
+    local tmp f flavors
+    tmp="$(mktemp -d /tmp/mac-clip.XXXXXX)" || return 1
+    flavors="$(osascript -e 'clipboard info' 2>/dev/null)"
+    case "$flavors" in
+        *furl*)
+            f="$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null)"
+            case "$(printf '%s' "${f##*.}" | tr 'A-Z' 'a-z')" in
+                png) cp "$f" "$tmp/clip.png" && { echo "$tmp/clip.png"; return 0; } ;;
+                jpg|jpeg|gif|webp|heic|bmp|tif|tiff)
+                    sips -s format png "$f" --out "$tmp/clip.png" >/dev/null 2>&1 && { echo "$tmp/clip.png"; return 0; } ;;
+            esac ;;
+    esac
+    for flavor in PNGf TIFF; do
+        osascript >/dev/null 2>&1 \
+            -e "set f to (open for access POSIX file \"$tmp/clip.$flavor\" with write permission)" \
+            -e "set eof f to 0" \
+            -e "write (the clipboard as «class $flavor») to f" \
+            -e "close access f"
+        if [ -s "$tmp/clip.$flavor" ]; then
+            if [ "$flavor" = PNGf ]; then mv "$tmp/clip.PNGf" "$tmp/clip.png"
+            else sips -s format png "$tmp/clip.TIFF" --out "$tmp/clip.png" >/dev/null 2>&1 || continue; fi
+            echo "$tmp/clip.png"; return 0
+        fi
+    done
+    rm -rf "$tmp"; return 1
+}
+
+case "$req" in
+    targets)
+        flavors="$(osascript -e 'clipboard info' 2>/dev/null)"
+        case "$flavors" in
+            *PNGf*|*TIFF*) echo image/png ;;
+            *furl*)
+                f="$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null)"
+                case "$(printf '%s' "${f##*.}" | tr 'A-Z' 'a-z')" in
+                    png|jpg|jpeg|gif|webp|heic|bmp|tif|tiff) echo image/png ;;
+                esac ;;
+        esac ;;
+    image/png)
+        f="$(image_file)" && { cat "$f"; rm -rf "$(dirname "$f")"; } ;;
+    copy)
+        pbcopy ;;
+    "open http://"*|"open https://"*)
+        url="${req#open }"
+        case "$url" in
+            *[[:space:][:cntrl:]]*) ;;
+            *) open "$url" ;;
+        esac ;;
+esac
+exit 0

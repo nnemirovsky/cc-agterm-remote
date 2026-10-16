@@ -1,0 +1,19 @@
+#!/usr/bin/expect -f
+# Runs one remote-control server for systemd (claude-rc@<name>.service): starts
+# `claude remote-control` in server mode under a pty, answers its one-time
+# "Enable Remote Control?" prompt, and stays in the foreground so systemd can
+# supervise it. The directory and the name come from the instance's
+# ~/.config/cc-agterm-remote/rc/<name>.env (RC_DIR, RC_NAME); see claude-rc.
+#
+# --no-create-session-in-dir keeps the server idle at "Capacity: 0/32" until
+# the Claude app asks it for a session.
+set timeout -1
+set workdir $env(RC_DIR)
+set name    $env(RC_NAME)
+
+cd $workdir
+spawn claude remote-control --spawn same-dir --no-create-session-in-dir --name $name
+expect {
+    -re "Enable Remote Control\\? \\(y/n\\)" { send "y\r"; exp_continue }
+    eof { exit }
+}

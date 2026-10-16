@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Manage Claude Code remote-control servers: the entry points the Claude app
+# (phone, claude.ai/code) creates new sessions on this machine through. Each is
+# a systemd user unit, claude-rc@<name>.service, running claude-rc-start in its
+# directory.
+#
+#   claude-rc add <name> <dir> [rc-name]   create, enable and start one
+#                                          (rc-name: what the app lists; default <host>-<name>)
+#   claude-rc remove <name>                stop, disable and delete one
+#   claude-rc list                         every server, its directory and state
+#   claude-rc env <name>                   the app's environment id, from the unit's journal
+#
+# `add` records the directory, the name and the PATH of your login shell (so
+# sessions the app starts find your toolchain) in
+# ~/.config/cc-agterm-remote/rc/<name>.env, and marks the directory trusted in
+# ~/.claude.json, since a server has no terminal for the trust dialog.
+#
+# A unit runs only while you are logged in unless lingering is on:
+#   loginctl enable-linger "$USER"     (may need sudo)
+set -uo pipefail
+
+ENVDIR="$HOME/.config/cc-agterm-remote/rc"
+export PATH="$HOME/.local/bin:$PATH"
+
+die() { echo "claude-rc: $*" >&2; exit 1; }
+
+valid_name() {
+    case "$1" in ''|*[!A-Za-z0-9_-]*) die "name must be letters, digits, - or _: '$1'" ;; esac
+}
+
+unit() { printf 'claude-rc@%s.service' "$1"; }
+
+case "${1:-list}" in
+    add)
+        name="${2:-}" dir="${3:-}"
+        valid_name "$name"
+        [ -n "$dir" ] || die "usage: claude-rc add <name> <dir> [rc-name]"
+        dir="$(cd "$dir" 2>/dev/null && pwd)" || die "no such directory: $3"
+        rc_name="${4:-$(hostname -s)-$name}"
+        command -v expect >/dev/null || die "expect is not installed"
+        command -v claude >/dev/null || die "claude is not on PATH"
+
+        mkdir -p "$ENVDIR"
+        # Each directory once: a login shell that sources ~/.bashrc more than once
+        # repeats its PATH additions.
+        login_path="$(bash -lc 'printf %s "$PATH"' 2>/dev/null | tr : '\n' | awk 'NF && !seen[$0]++' | paste -sd: -)"
+        {
+            printf 'RC_DIR=%s\n' "$dir"
+            printf 'RC_NAME=%s\n' "$rc_name"
+            printf 'PATH=%s\n' "${login_path:-$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin}"
+        } > "$ENVDIR/$name.env"
+
+        # Trust the directory. Written through a temporary file and a rename, so
+        # a session rewriting ~/.claude.json at the same moment cannot leave it
+        # half written; check the result if one was busy.
+        if [ -f "$HOME/.claude.json" ]; then
+            tmp="$(mktemp "$HOME/.claude.json.XXXXXX")"
+            jq --arg d "$dir" '.projects[$d].hasTrustDialogAccepted = true' "$HOME/.claude.json" > "$tmp" &&
+                mv "$tmp" "$HOME/.claude.json" || { rm -f "$tmp"; echo "could not mark $dir trusted; run claude there once" >&2; }
+        fi
+
+        systemctl --user daemon-reload
+        systemctl --user enable --now "$(unit "$name")" || die "could not start $(unit "$name")"
+        echo "started $(unit "$name") in $dir as \"$rc_name\""
+        [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = yes ] ||
+            echo "note: lingering is off, so it stops when you log out: loginctl enable-linger $USER"
+        ;;
+    remove)
+        name="${2:-}"
+        valid_name "$name"
+        systemctl --user disable --now "$(unit "$name")" 2>/dev/null
+        rm -f "$ENVDIR/$name.env"
+        systemctl --user daemon-reload
+        echo "removed $(unit "$name")"
+        ;;
+    list)
+        for f in "$ENVDIR"/*.env; do
+            [ -f "$f" ] || continue
+            name="$(basename "$f" .env)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$(systemctl --user is-active "$(unit "$name")" 2>/dev/null)" \
+                "$(sed -n 's/^RC_NAME=//p' "$f")" "$(sed -n 's/^RC_DIR=//p' "$f")"
+        done
+        ;;
+    env)
+        name="${2:-}"
+        valid_name "$name"
+        # The id changes on every restart of the unit.
+        journalctl --user -u "$(unit "$name")" --no-pager -n 400 2>/dev/null |
+            grep -oE 'environment=[A-Za-z0-9_-]+' | tail -1 | cut -d= -f2
+        ;;
+    -h|--help|help)
+        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        die "unknown command: $1 (see --help)"
+        ;;
+esac

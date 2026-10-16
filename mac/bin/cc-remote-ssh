@@ -1,0 +1,48 @@
+#!/bin/bash
+# What an agterm pane runs for a remote session: `ssh -t <host> <command>`,
+# started again when the link drops.
+#
+#   cc-remote-ssh [--pane] <remote command>
+#
+# agterm closes a --command pane when its command exits, and a dropped network
+# makes ssh exit non-zero, so without the retry a pane vanished on every blip,
+# taking the view (not the session) with it. A clean exit (quitting the shell,
+# detaching) still ends the pane.
+#
+# Only ssh's own failures (255) and signals (>= 128) are retried. Any other
+# non-zero came from the remote command, a deleted session say, which would
+# fail the same way forever, so the pane stops and shows why. The wait backs
+# off from 3 s to 30 s, so a lid closed for hours does not hammer the network,
+# and resets after a connection that lasted.
+#
+# --pane passes this pane's agterm id to the remote command as CC_REMOTE_PANE,
+# so a claude started by hand in a plain shell pane still reports to it.
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# shellcheck source=cc-remote-config
+. "$(dirname "$0")/cc-remote-config"
+need_host
+
+prefix=""
+if [ "${1:-}" = "--pane" ]; then
+    shift
+    [ -n "${AGTERM_SESSION_ID:-}" ] && prefix="export CC_REMOTE_PANE=$(printf '%q' "$AGTERM_SESSION_ID"); "
+fi
+cmd="${1:?usage: cc-remote-ssh [--pane] <remote command>}"
+
+d=3
+while :; do
+    t0=$(date +%s)
+    ssh -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=10 "$HOST" "$prefix$cmd"
+    s=$?
+    [ $s -eq 0 ] && break
+    if [ $s -ne 255 ] && [ $s -lt 128 ]; then
+        printf '\n[%s: remote command failed (exit %s), not retrying]\n' "$NAME" "$s"
+        break
+    fi
+    [ $(( $(date +%s) - t0 )) -gt 30 ] && d=3
+    printf '\n[%s: link lost (exit %s), reconnecting in %ss, ctrl-c to stop]\n' "$NAME" "$s" "$d"
+    sleep "$d"
+    d=$(( d * 2 )); [ $d -gt 30 ] && d=30
+done
+exit $s

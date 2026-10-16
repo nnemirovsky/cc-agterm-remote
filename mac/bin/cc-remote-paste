@@ -1,0 +1,18 @@
+#!/bin/bash
+# cmd+v in agterm: paste text as usual, but with only an image on the clipboard,
+# send ctrl+v instead, which is how Claude Code pastes an image. That works the
+# same in a local session and in a remote one, where ctrl+v reaches the Mac
+# clipboard through the xclip stand-in.
+#
+# Bound in ~/.config/agterm/keymap.conf by install.sh:
+#   command "Paste (image to Claude Code)" cmd+v  ~/.local/bin/cc-remote-paste
+AGTERMCTL="${AGTERMCTL:-$(command -v agtermctl || echo /Applications/agterm.app/Contents/MacOS/agtermctl)}"
+target="${AGT_SESSION_ID:-active}"
+pane=()
+[ -n "${AGT_PANE:-}" ] && pane=(--pane "$AGT_PANE")
+
+if [ -z "$(pbpaste 2>/dev/null | head -c 1)" ] &&
+   osascript -e 'clipboard info' 2>/dev/null | grep -qE 'PNGf|TIFF|JPEG|GIFf|«class PNGf»'; then
+    exec "$AGTERMCTL" session type --target "$target" "${pane[@]+"${pane[@]}"}" "$(printf '\026')"
+fi
+exec "$AGTERMCTL" session paste --target "$target"
