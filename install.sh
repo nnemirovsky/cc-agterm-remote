@@ -87,7 +87,13 @@ mac_install() {
         sed -n '/^command /p' "$here/mac/keymap.conf" | sed -e "s|@BIN@|$BIN|g" -e "s|@NAME@|$NAME|g"
         printf '# <<< cc-agterm-remote <<<\n'
     } >> "$KEYMAP"
-    say "added the chords to $KEYMAP (reload agterm's keymap, or restart it, to pick them up)"
+    # agterm keeps the old bindings until told to re-read the file, and a
+    # binding to a script that moved does nothing at all.
+    if "${AGTERMCTL:-$(command -v agtermctl || echo /Applications/agterm.app/Contents/MacOS/agtermctl)}" keymap reload >/dev/null 2>&1; then
+        say "added the chords to $KEYMAP and reloaded agterm's keymap"
+    else
+        say "added the chords to $KEYMAP (agterm is not running; it reads them at launch)"
+    fi
 }
 
 mac_uninstall() {
