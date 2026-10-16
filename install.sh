@@ -76,7 +76,13 @@ mac_install() {
         sed -e "s|@BIN@|$BIN|g" -e "s|@STATE@|$STATE|g" "$here/mac/launchd/$label.plist" > "$AGENTS/$label.plist"
         plutil -lint -s "$AGENTS/$label.plist" || die "bad plist $label"
         launchctl bootout "gui/$(id -u)/$label" 2>/dev/null
-        launchctl bootstrap "gui/$(id -u)" "$AGENTS/$label.plist" || die "launchd refused $label"
+        # bootout returns before the job is gone, and a bootstrap that races it
+        # fails with an I/O error, so try a few times.
+        for try in 1 2 3 4 5; do
+            launchctl bootstrap "gui/$(id -u)" "$AGENTS/$label.plist" 2>/dev/null && break
+            [ "$try" = 5 ] && die "launchd refused $label"
+            sleep 1
+        done
     done
     say "started the launchd agents ${LABELS[*]}"
 
