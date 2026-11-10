@@ -53,8 +53,27 @@ rbash() {
     ssh "$HOST" "bash -s --$args"
 }
 
+# Defined on the server ahead of a script that lists sessions. `claude agents`
+# also reports headless runs (`claude --print`, which a review tool starts inside
+# a session's own directory) as kind "interactive", the same as a session the
+# Claude app started. They are not sessions to attach or take over, and killing
+# one breaks the run that started it, so they are dropped. Only the session file
+# tells them apart, by its entrypoint.
+read -r -d '' DROP_HEADLESS <<'EOS' || true
+drop_headless() {
+    local h
+    h=$(jq -s -c 'map(select(.entrypoint == "sdk-cli") | .pid)' "$HOME"/.claude/sessions/*.json 2>/dev/null)
+    jq --argjson h "${h:-[]}" 'map(select(.pid | IN($h[]) | not))'
+}
+EOS
+
 remote_sessions() {
-    ssh "$HOST" "${RPATH}claude agents --json" 2>/dev/null
+    { printf '%s\n' "$DROP_HEADLESS"; cat <<'EOS'
+export PATH="$HOME/.local/bin:$PATH"
+s=$(claude agents --json) || exit 1
+drop_headless <<<"$s"
+EOS
+    } | rbash 2>/dev/null
 }
 
 # Every session, running and stopped, each with `active`: when its transcript was
@@ -62,14 +81,16 @@ remote_sessions() {
 # only startedAt, which would sort a long-lived session stopped a minute ago below
 # one started yesterday.
 all_sessions() {
-    rbash <<'EOS' 2>/dev/null
+    { printf '%s\n' "$DROP_HEADLESS"; cat <<'EOS'
 export PATH="$HOME/.local/bin:$PATH"
 s=$(claude agents --json --all) || exit 1
+s=$(drop_headless <<<"$s")
 m=$(find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -printf '%f\t%T@\n' 2>/dev/null |
     jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
               | {key: (.[0] | sub("\\.jsonl$"; "")), value: (.[1] | tonumber)}) | from_entries')
 jq --argjson m "${m:-{\}}" 'map(. + {active: ($m[.sessionId // ""] // ((.startedAt // 0) / 1000))})' <<<"$s"
 EOS
+    } | rbash 2>/dev/null
 }
 
 # What stopping a session could also clean up, judged in its working directory on

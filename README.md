@@ -106,6 +106,8 @@ supervisor retires idle ones after about an hour without losing them: they show 
   Attaching one takes it over (experimental): its process is stopped and the session resumed as a
   background session under the same id, which the app still reaches. Claude gets a note about it;
   `CC_REMOTE_NO_TAKEOVER_NOTE=1` leaves it out.
+- **Headless runs** (`claude --print`, such as the reviewers a review tool starts inside a session)
+  are left out of the pickers, although `claude agents` lists them.
 - **Plain shells** (`cmd+shift+s`) follow the remote shell's title, which the `~/.bashrc` block marks
   `⧉ ~/dir`. A `claude` started by hand in one still reports to its pane, through `CC_REMOTE_PANE`.
 
