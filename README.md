@@ -1,13 +1,14 @@
 # cc-agterm-remote
 
-Run Claude Code on a Linux server and work with it from [agterm](https://github.com/umputun/agterm)
+Run Claude Code on a Linux server (or several) and work with it from [agterm](https://github.com/umputun/agterm)
 on your Mac as if it ran locally. Sessions keep going while the laptop sleeps, the Claude app on your
 phone can start and drive them, and long builds and test suites run on a machine sized for them.
 
 What you get on the Mac:
 
 - **Chords to manage remote sessions.** Pick a session and attach, restart, stop, resume or clean
-  up its worktree; start a new one in a directory picked from the server; open a plain shell.
+  up its worktree; start a new one in a directory picked from the server; open a plain shell. With
+  several servers the pickers list the sessions of all of them.
 - **The agent-status glyph on remote panes**, the same busy / waiting / done dot agterm shows for a
   local session, and Claude's own session name as the pane name.
 - **Ctrl+V pastes a Mac clipboard image** into a remote Claude Code prompt, and Claude's own copy
@@ -24,8 +25,8 @@ And on the server:
 ## Requirements
 
 - macOS with agterm (0.24 tested) and `jq` (`brew install jq`).
-- A Linux server with systemd, reached by `ssh <host>` with key-based login and no prompt. A
-  private network such as Tailscale is the sensible way to reach it (see Security).
+- One or more Linux servers with systemd, each reached by `ssh <host>` with key-based login and no
+  prompt. A private network such as Tailscale is the sensible way to reach them (see Security).
 - On the server: Claude Code (native install, 2.1.301 tested), `jq`, `netcat-openbsd` (or
   `python3`), `expect` for remote-control servers, and bash as your login shell for the automatic
   `~/.bashrc` setup.
@@ -39,18 +40,21 @@ piece of this; the tested versions are above.
 ```bash
 git clone https://github.com/nnemirovsky/cc-agterm-remote
 cd cc-agterm-remote
-./install.sh          # writes ~/.config/cc-agterm-remote/config and stops: set CC_REMOTE_HOST
-./install.sh          # installs both sides
+./install.sh          # writes ~/.config/cc-agterm-remote/config and stops: set CC_REMOTE_HOSTS
+./install.sh          # installs the Mac side and the server side on every host
 ```
 
 The configuration (`config.example` has every key):
 
 ```bash
-CC_REMOTE_HOST=devbox                 # the ssh host
-CC_REMOTE_NAME=devbox                 # what pickers and chords call it (default: the host)
+CC_REMOTE_HOSTS=(devbox buildbox)     # the ssh hosts; the first is the default for new sessions
+CC_REMOTE_NAMES=("devbox=dev box")    # what pickers call a host (default: the host)
 CC_REMOTE_ROOTS=(dev src)             # where the new-session picker looks for repos
 CC_REMOTE_DIRS=("dev/work=work root") # extra picker rows, path=label
 ```
+
+A configuration from before `CC_REMOTE_HOSTS`, with a single `CC_REMOTE_HOST` (and
+`CC_REMOTE_NAME`), still works. See "Several servers" for adding one.
 
 `install.sh` puts the scripts into `~/.local/bin` on both machines. On the Mac it starts two launchd
 agents, `cc-agterm-remote.bridge` and `cc-agterm-remote.clipboard`, and appends the chords to
@@ -58,7 +62,7 @@ agents, `cc-agterm-remote.bridge` and `cc-agterm-remote.clipboard`, and appends 
 the `claude-rc` units to `~/.config/systemd/user`, and small blocks to `~/.bashrc` and
 `~/.tmux.conf`. Everything it adds to a file of yours sits between `cc-agterm-remote` markers. Run it
 again after pulling a new version; `./install.sh uninstall` takes it all out (`--mac` or `--server`
-for one side).
+for one side, `--host <host>` for one server).
 
 The plugin is installed separately, on both machines:
 
@@ -72,9 +76,9 @@ claude plugin install rename-session@cc-agterm-remote
 | chord | what |
 |---|---|
 | `cmd+shift+r` | Manage remote sessions: pick one, then attach / restart / kill / clean up / cancel. Stopped sessions sit under a separator, most recently active first, and resume. |
-| `cmd+shift+h` | New remote Claude Code session, in a directory from a picker or a typed path. |
+| `cmd+shift+h` | New remote Claude Code session: with several servers, pick one (the first is the default), then a directory there from a picker or a typed path. |
 | `cmd+shift+k` | From inside an attached pane: restart its session, or stop it and close the pane, optionally removing its worktree and branch. |
-| `cmd+shift+s` | New plain ssh shell on the server, same directory picker. |
+| `cmd+shift+s` | New plain ssh shell on a server, same server and directory pickers. |
 | `cmd+shift+v` | Paste a clipboard image by uploading it and typing its path (the fallback for Ctrl+V). |
 | `cmd+shift+i` | Show the image whose path is selected (or copied), from the Mac or the server. |
 | `cmd+v` | Paste as usual, but with only an image on the clipboard send Ctrl+V, which is how Claude Code pastes an image. In the quick terminal it types single-line text and refuses multi-line text, since agterm can only type there and each line would run. |
@@ -114,6 +118,39 @@ supervisor retires idle ones after about an hour without losing them: they show 
 Remote panes are named `⧉ ✳ <session name>`: `⧉` marks remote, `✳` marks Claude. The bridge
 relabels a pane when Claude names its session.
 
+## Several servers
+
+List them in `CC_REMOTE_HOSTS`. Everything else follows:
+
+- **The pickers ask every server at once** and lead each row with its host. A server that does not
+  answer within `CC_REMOTE_CONNECT_TIMEOUT` seconds (5) shows as an `unavailable` row; the others
+  list as usual.
+- **Every action goes to the session's own server**: attach, restart, resume, kill, clean up, take
+  over, the stop chord, and `cmd+shift+v` / `cmd+shift+i`, which find the server in the pane's ssh
+  command. `cc-remote-attach <host>:<id>` names one from a terminal; a bare id is looked up on
+  every server.
+- **New sessions and shells ask for the server first**, the first one in the list on top, and the
+  directory picker then lists that server's directories. `cc-remote-attach --host <host> --new`
+  skips the question, so a chord per server is one line in the keymap.
+- **A session moved to another server** keeps its id. Its stopped copy on the old server is hidden
+  while it runs on the new one, and one stopped on both shows once, where it was active last.
+- **The bridge keeps one connection per server**, each reconnecting on its own, and forwards the
+  clipboard socket to each.
+
+The pane map records each pane as `<host>:<id>`. Panes and map entries from before `CC_REMOTE_HOSTS`
+carry no host and belong to `CC_REMOTE_HOST`, so keep that set to the old server while such panes
+are open:
+
+```bash
+CC_REMOTE_HOSTS=(newbox oldbox)
+CC_REMOTE_HOST=oldbox                 # the server older panes run on
+```
+
+To add a server, put it in `CC_REMOTE_HOSTS` and run `./install.sh --host <host>` for its server
+side, then `./install.sh --mac` (or reload the bridge:
+`launchctl kickstart -k gui/$(id -u)/cc-agterm-remote.bridge`) so the bridge connects to it.
+Remote-control servers (`claude-rc add`) are per server; the app lists them as `<host>-<name>`.
+
 ## How the pieces fit
 
 ```
@@ -122,7 +159,7 @@ Mac (agterm)                                       server
 chords ─ cc-remote-attach ──────ssh─────────────▶ claude agents / attach / stop / --bg --resume
 pane   ─ cc-remote-ssh (reconnects) ─ssh -t─────▶ claude attach <id>
 
-cc-remote-bridge ◀───────ssh tail -F──────────── ~/.cache/cc-agterm-remote/status.jsonl
+cc-remote-bridge ◀────ssh tail -F, per server─── ~/.cache/cc-agterm-remote/status.jsonl
   │   (launchd)                                      ▲
   └─ agtermctl session status                        └─ cc-remote-status (Claude Code hooks)
 
@@ -135,7 +172,8 @@ phone / claude.ai ────────────────────�
 ```
 
 **Status.** Claude Code hooks on the server append `{session_id, state}` lines to a journal, and the
-bridge tails it over one persistent ssh connection and paints the pane that shows that session.
+bridge tails it over one persistent ssh connection per server and paints the pane that shows that
+session.
 The mapping lives on the Mac, because a phone-started session or a background daemon has no
 `AGTERM_*` environment to report a pane with.
 
@@ -234,7 +272,7 @@ Each of these cost real time once.
 - **Long work in background shells**: `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` stops Claude Code
   killing an idle session's background shells under memory pressure, and `BASH_MAX_TIMEOUT_MS`
   raises their 2-hour limit. Both go in the server's settings `env` block and apply to new sessions.
-- **The bridge**: `cc-remote-bridge --once` prints the configuration and the pane map;
+- **The bridge**: `cc-remote-bridge --once` prints the configuration, the servers and the pane map;
   its log is `~/.config/cc-agterm-remote/bridge.log`, and
   `launchctl kickstart -k gui/$(id -u)/cc-agterm-remote.bridge` restarts it.
 
