@@ -8,8 +8,19 @@ CC_REMOTE_CONFIG="${CC_REMOTE_CONFIG:-$HOME/.config/cc-agterm-remote/config}"
 # shellcheck source=/dev/null
 [ -f "$CC_REMOTE_CONFIG" ] && . "$CC_REMOTE_CONFIG"
 
-HOST="${CC_REMOTE_HOST:-}"
-NAME="${CC_REMOTE_NAME:-$HOST}"
+# The servers: CC_REMOTE_HOSTS, the first of them the default for new sessions
+# and shells, or the single CC_REMOTE_HOST of an older configuration. With both
+# set, CC_REMOTE_HOST is the LEGACY host: panes and pane-map entries made before
+# there were several servers carry no host, and they belong to it.
+if [ -n "${CC_REMOTE_HOSTS+x}" ]; then
+    HOSTS=("${CC_REMOTE_HOSTS[@]}")
+elif [ -n "${CC_REMOTE_HOST:-}" ]; then
+    HOSTS=("$CC_REMOTE_HOST")
+else
+    HOSTS=()
+fi
+HOST="${HOSTS[0]:-}"
+LEGACY_HOST="${CC_REMOTE_HOST:-$HOST}"
 STATE="$HOME/.config/cc-agterm-remote"
 MAP="$STATE/map.json"
 CLIPBOARD_SOCK="$STATE/clipboard.sock"
@@ -20,6 +31,97 @@ BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # to the remote home.
 REMOTE_STATE=".cache/cc-agterm-remote"
 
+# ssh options for a quick question to a server that may be down: no prompt, a
+# short connect timeout, and a link that dies within seconds when it stalls, so
+# a dead host cannot hold up a picker.
+SSH_QUICK=(-o BatchMode=yes -o ConnectTimeout="${CC_REMOTE_CONNECT_TIMEOUT:-5}"
+           -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
+
+# What pickers, panes and messages call host $1: its CC_REMOTE_NAMES entry
+# ("host=name"), the CC_REMOTE_NAME of an older single-host configuration, or
+# the host itself.
+host_label() {
+    local e
+    for e in ${CC_REMOTE_NAMES[@]+"${CC_REMOTE_NAMES[@]}"}; do
+        [ "${e%%=*}" = "$1" ] && { printf '%s' "${e#*=}"; return; }
+    done
+    if [ "$1" = "${CC_REMOTE_HOST:-}" ] && [ -n "${CC_REMOTE_NAME:-}" ]; then
+        printf '%s' "$CC_REMOTE_NAME"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Point HOST and NAME, which the scripts' remote commands and messages use, at
+# host $1.
+use_host() {
+    HOST="$1"
+    NAME="$(host_label "$1")"
+}
+NAME="$(host_label "$HOST")"
+
+# Whether $1 is one of the configured hosts.
+is_host() {
+    local h
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do [ "$h" = "$1" ] && return 0; done
+    return 1
+}
+
+multi_host() { [ "${#HOSTS[@]}" -gt 1 ]; }
+
+# The configured hosts as a JSON array, and as {host: label}.
+hosts_json() {
+    printf '%s\n' ${HOSTS[@]+"${HOSTS[@]}"} | jq -R . | jq -s -c 'map(select(length > 0))'
+}
+host_labels_json() {
+    local h
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        jq -nc --arg h "$h" --arg l "$(host_label "$h")" '{($h): $l}'
+    done | jq -s -c 'add // {}'
+}
+
+# The pane-map (map.json) key of session id $2 on host $1. A key without a host
+# is the legacy host's.
+map_key() { printf '%s:%s' "$1" "$2"; }
+
+# The agterm pane that shows session id $2 (short id or uuid) on host $1.
+map_pane() {
+    local bare=false
+    [ "$1" = "$LEGACY_HOST" ] && bare=true
+    jq -r --arg k "$(map_key "$1" "$2")" --arg s "$2" --argjson bare "$bare" \
+        '.[$k] // (if $bare then .[$s] else null end) // empty' "$MAP" 2>/dev/null
+}
+
+# The configured host agterm pane $1 ("active": the focused one) talks to: the
+# first argument of its foreground process that names a configured host (what
+# `cc-remote-ssh --host <host>` and a hand-typed `ssh <host>` both have), else
+# the legacy host, which panes made before there were several servers use.
+pane_host() {
+    local h
+    h="$("$AGTERMCTL" tree --json 2>/dev/null | jq -r --arg id "$1" --argjson hosts "$(hosts_json)" '
+        [ .result.tree.workspaces[]
+          | select($id != "active" or .active)
+          | .sessions[]
+          | select(.id == $id or ($id == "active" and .active)) ]
+        | [.[0].foreground // [] | .[] | select(IN($hosts[]))] | .[0] // empty' 2>/dev/null)"
+    printf '%s' "${h:-$LEGACY_HOST}"
+}
+
+# Run "$@", killing it after $1 seconds (macOS has no `timeout`). Returns its
+# status, which is 143 when it was killed.
+deadline() {
+    local secs="$1" pid watch rc
+    shift
+    "$@" &
+    pid=$!
+    ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    watch=$!
+    wait "$pid" 2>/dev/null
+    rc=$?
+    kill "$watch" 2>/dev/null
+    return $rc
+}
+
 # A chord runs these with stderr going nowhere, so a failure is also posted as
 # a desktop notification.
 notify_fail() {
@@ -29,6 +131,6 @@ notify_fail() {
 
 need_host() {
     [ -n "$HOST" ] && return 0
-    notify_fail "no server configured: set CC_REMOTE_HOST in $CC_REMOTE_CONFIG"
+    notify_fail "no server configured: set CC_REMOTE_HOSTS (or CC_REMOTE_HOST) in $CC_REMOTE_CONFIG"
     exit 1
 }

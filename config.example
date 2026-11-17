@@ -2,19 +2,33 @@
 # install.sh. Copy it to ~/.config/cc-agterm-remote/config and edit.
 # It is sourced by bash, so keep to plain assignments.
 
-# The ssh host the sessions run on, as you would type it after `ssh`. Set up
-# key-based access and an entry in ~/.ssh/config first: the scripts run ssh
-# non-interactively and expect it to connect without a prompt.
-CC_REMOTE_HOST=devbox
+# The ssh hosts the sessions run on, as you would type them after `ssh`. Set up
+# key-based access and an entry in ~/.ssh/config for each first: the scripts run
+# ssh non-interactively and expect it to connect without a prompt. The pickers
+# list the sessions of every host; the first one is the default for new
+# sessions and shells.
+CC_REMOTE_HOSTS=(devbox)
 
-# What the pickers, chords and messages call the server. Defaults to the host.
-#CC_REMOTE_NAME=devbox
+# The single host of an older configuration, still read when CC_REMOTE_HOSTS is
+# not set. Next to CC_REMOTE_HOSTS it names the host that panes and pane-map
+# entries made before CC_REMOTE_HOSTS existed belong to: keep it set to the old
+# host until those panes are gone.
+#CC_REMOTE_HOST=devbox
 
-# Where the "new session" picker looks for git repositories on the server,
-# up to three levels deep. Relative to the remote home, or absolute.
+# What the pickers, panes and messages call a host, as "host=name". Defaults to
+# the host. (CC_REMOTE_NAME still names the single CC_REMOTE_HOST.)
+#CC_REMOTE_NAMES=("devbox=dev box")
+
+# Where the "new session" picker looks for git repositories on the chosen
+# server, up to three levels deep. Relative to the remote home, or absolute.
 #CC_REMOTE_ROOTS=(dev src)
 
 # Extra rows for the "new session" picker, as "path=label". Relative to the
-# remote home, or absolute. Directories that host a remote-control server
-# (claude-rc) are listed first without being named here.
+# remote home, or absolute; a host that lacks the directory leaves the row out.
+# Directories that host a remote-control server (claude-rc) are listed first
+# without being named here.
 #CC_REMOTE_DIRS=("dev/work=work root")
+
+# Seconds to wait for a server to accept the ssh connection before the pickers
+# show it as unavailable (5).
+#CC_REMOTE_CONNECT_TIMEOUT=5
