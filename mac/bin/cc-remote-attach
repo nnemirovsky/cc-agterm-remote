@@ -281,12 +281,12 @@ EOS
 # its label, after the host's mark, when there are several hosts, and is part of
 # its id ("bg:<host>:<id>", "app:<host>:<uuid>"; see split_choice). A host that
 # did not answer gets an "unavailable" row ("down:<host>") above the stopped
-# ones. With several hosts a first row ("legend") says which mark is which
-# server's, as pane names carry them; pick_session opens on the row after it.
+# ones. With several hosts each row leads with the host's mark and name, the
+# same mark the pane names carry.
 SEP_ID="sep"
 picker_rows() {
     jq -c --argjson multi "$(multi_host && echo true || echo false)" --argjson names "$(host_labels_json)" \
-          --argjson marks "$(host_marks_json)" --arg legend "$(mark_legend)" '
+          --argjson marks "$(host_marks_json)" '
         def running: .kind == "background" and has("pid");
         def stopped: .kind == "background" and (has("pid") | not);
         def app: .kind != "background" and .kind != "unreachable";
@@ -297,8 +297,7 @@ picker_rows() {
         def host_name: "\($marks[.host] // "?") \($names[.host] // .host)";
         def host_tag: if $multi then "\(host_name) · " else "" end;
         ([.[] | select(running or app) | .sessionId]) as $live
-        | (if $multi then [{id: "legend", label: $legend, subtitle: "which server a pane is on: the mark leading its name"}] else [] end)
-        + ([.[] | select(running)] | sort_by(order)
+        | ([.[] | select(running)] | sort_by(order)
            | map({id: "bg:\(.host):\(.id)", label: "\(host_tag)\(badge) · \(.name // .id)", subtitle: .cwd}))
         + [.[] | select(app)
            | {id: "app:\(.host):\(.sessionId)", label: "\(host_tag)from app · \(.name)", subtitle: .cwd}]
@@ -313,7 +312,7 @@ picker_rows() {
 }
 
 # Open a session picker on picker_rows' rows $1 with prompt $2, the first
-# session row highlighted (the legend above it would only cancel), and print the
+# session row highlighted, and print the
 # picked row's id. pick prints {"id":…,"result":"picked","label":…}; `result` is
 # a string, so index only `.id`, and treat anything but "picked" as a cancel.
 pick_session() {
@@ -799,7 +798,7 @@ case "${1:-}" in
             down="$(unreachable <<<"$sessions")"
             die "no sessions on $SCOPE servers${down:+ (no answer from $down)}"
         fi
-        # The legend, separator and "unavailable" rows cancel.
+        # The separator and "unavailable" rows cancel.
         choice="$(pick_session "$items" "$SCOPE Claude Code sessions")"
         split_choice "$choice" || { echo "cancelled" >&2; exit 0; }
 

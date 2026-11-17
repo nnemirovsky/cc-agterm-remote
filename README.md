@@ -135,8 +135,7 @@ CC_REMOTE_MARKS=("torvalds=⧉t" "ritchie=⧉r")
 ```
 
 A mark is one word without quotes, backslashes, `$`, `` ` `` or `!`; `install.sh` refuses another.
-The session pickers open with a legend row (`ⓣ torvalds · ⓡ ritchie`) and lead each session with
-its server's mark and name, and the new-session and new-shell server picker lists each server
+The session pickers lead each session with its server's mark and name (`ⓣ torvalds · busy · …`), and the new-session and new-shell server picker lists each server
 after its mark. `cc-remote-bridge --once` prints the marks too.
 
 The Mac names Claude panes, so a changed mark reaches them on its own: the bridge renames every
