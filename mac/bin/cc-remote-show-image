@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render an image in an agterm overlay, whether the file is on the Mac or on the server.
 #
-#   cc-remote-show-image <path> [size-percent]   explicit path, local or remote
+#   cc-remote-show-image <path> [size-percent]   explicit path, local or remote (<host>:<path>)
 #   cc-remote-show-image                         use the pane selection ($AGT_SELECTION)
 #
 # Why this exists: agterm renders images natively through the kitty graphics protocol, but only
@@ -61,6 +61,14 @@ if [ -z "$path" ]; then
 fi
 [ -n "$path" ] || fail "nothing that looks like a path in: $(printf '%.60s' "$raw")" 2
 
+# Which server a remote path is on: the one a "<host>:" prefix names, else the
+# one this pane talks to (pane_host in cc-remote-config), else the default.
+explicit=""
+case "$path" in
+    *:*) if is_host "${path%%:*}"; then use_host "${path%%:*}"; path="${path#*:}"; explicit=1; fi ;;
+esac
+[ -z "$explicit" ] && [ -n "${AGT_SESSION_ID:-}" ] && use_host "$(pane_host "$AGT_SESSION_ID")"
+
 # Locate the bundled renderer. It lives in the installed skill or in a plugin cache.
 finder=""
 for c in "$HOME/.claude/skills/agterm/scripts/show-image.sh" \
@@ -80,15 +88,17 @@ done
 INBOX=".cache/inline-images/inbox"
 remote_session=""
 if [ -n "${AGT_SESSION_ID:-}" ] && [ -f "$MAP" ]; then
-    # The bridge's map holds both the short and the full session id per pane; take the full.
-    remote_session=$(jq -r --arg p "$AGT_SESSION_ID" \
-        'to_entries[] | select(.value == $p and (.key | length) == 36) | .key' \
+    # The bridge's map holds both the short and the full session id per pane, as
+    # "<host>:<id>" (or a bare legacy id); take the full one, and its host.
+    key=$(jq -r --arg p "$AGT_SESSION_ID" \
+        'to_entries[] | select(.value == $p and (.key | split(":") | last | length) == 36) | .key' \
         "$MAP" 2>/dev/null | head -1)
+    remote_session="${key##*:}"
+    case "$key" in *:*) [ -n "$explicit" ] || use_host "${key%:*}" ;; esac
 fi
 if [ -n "$remote_session" ]; then
-    case "$path" in "$HOST":*) want="${path#*:}" ;; *) want="$path" ;; esac
     if ssh "$HOST" "mkdir -p ~/$INBOX && cat > ~/$INBOX/$remote_session && sleep 3 && test ! -s ~/$INBOX/$remote_session" \
-        <<<"$want" 2>/dev/null; then
+        <<<"$path" 2>/dev/null; then
         exit 0
     fi
     ssh "$HOST" ": > ~/$INBOX/$remote_session" 2>/dev/null
@@ -103,16 +113,19 @@ elif [ -n "${AGT_SESSION_ID:-}" ]; then
 fi
 
 local_path=""
-case "$path" in
-    "$HOST":*) remote="${path#*:}" ;;                        # explicit host:/path
-    /*|"~"/*|"~")
-        expanded="${path/#\~/$HOME}"
-        [ -f "$expanded" ] && local_path="$expanded" || remote="$path"
-        ;;
-    *)
-        [ -f "$path" ] && local_path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")" || remote="$path"
-        ;;
-esac
+if [ -n "$explicit" ]; then
+    remote="$path"                                           # explicit host:/path
+else
+    case "$path" in
+        /*|"~"/*|"~")
+            expanded="${path/#\~/$HOME}"
+            [ -f "$expanded" ] && local_path="$expanded" || remote="$path"
+            ;;
+        *)
+            [ -f "$path" ] && local_path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")" || remote="$path"
+            ;;
+    esac
+fi
 
 if [ -z "$local_path" ]; then
     # Not on this machine. Pull it from the server, keeping the basename so the overlay's
