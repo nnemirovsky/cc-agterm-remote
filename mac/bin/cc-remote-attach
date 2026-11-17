@@ -358,16 +358,63 @@ rm -f "$list"
 EOS
 }
 
+# Start listing every host's directories in the background, one file each in
+# DIRS_TMP, so the directory picker opens at once for whichever host is chosen.
+# Run it, and await_dirs, outside $(...): a command substitution would wait for
+# these jobs, and a subshell cannot wait for them.
+prefetch_dirs() {
+    local h i=0
+    DIRS_TMP="$(mktemp -d "${TMPDIR:-/tmp}/cc-remote-attach.XXXXXX")" || return 0
+    for h in "${HOSTS[@]}"; do
+        ( use_host "$h"; deadline "${CC_REMOTE_LIST_TIMEOUT:-20}" remote_dirs > "$DIRS_TMP/$i" ) 2>/dev/null &
+        DIRS_PID[i]=$!
+        i=$((i + 1))
+    done
+}
+
+# Wait for HOST's prefetched directories and set DIRS_FILE to them (empty when
+# nothing was prefetched).
+await_dirs() {
+    local h i=0
+    DIRS_FILE=""
+    [ -n "${DIRS_TMP:-}" ] || return 0
+    for h in "${HOSTS[@]}"; do
+        if [ "$h" = "$HOST" ]; then
+            wait "${DIRS_PID[i]}" 2>/dev/null
+            DIRS_FILE="$DIRS_TMP/$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+}
+
+# Ask which host a new session or shell goes to, the default (first) one on
+# top, and switch to it. Fails on cancel. With one host, or --host given, there
+# is nothing to ask.
+choose_host() {
+    local h choice
+    { [ -n "$WANT_HOST" ] || ! multi_host; } && return 0
+    choice="$(for h in "${HOSTS[@]}"; do
+                  jq -nc --arg h "$h" --arg l "$(host_label "$h")" --arg d "${HOSTS[0]}" \
+                      '{id: $h, label: $l, subtitle: (if $h == $d then "default · ssh \($h)" else "ssh \($h)" end)}'
+              done | jq -s -c . | "$AGTERMCTL" pick --prompt "$1" 2>/dev/null |
+              jq -r 'select(.result == "picked") | .id // empty')"
+    [ -n "$choice" ] || return 1
+    use_host "$choice"
+}
+
+# Pick a directory on HOST: a row from remote_dirs (or from file $2, which
+# holds its output), or a typed path.
 pick_dir() {
     local out home items choice prompt="${1:-new $NAME session in…}"
-    out="$(remote_dirs)"
+    if [ -n "${2:-}" ]; then out="$(cat "$2")"; else out="$(remote_dirs)"; fi
     home="$(awk -F"\t" "NR == 1 {print \$2}" <<<"$out")"
     items="$(sed '1d' <<<"$out" |
         jq -R -s --arg home "$home/" '
             split("\n") | map(select(length > 0) | split("\t")) |
             map({id: .[0], label: (.[0] | ltrimstr($home)), subtitle: .[1]})')"
 
-    [ "$(jq -r 'length' <<<"$items" 2>/dev/null)" != "0" ] || die "no candidate directories found on $HOST"
+    [ "$(jq -r 'length' <<<"$items" 2>/dev/null)" != "0" ] || die "$NAME did not answer, or has no candidate directories"
 
     choice="$(printf '%s' "$items" |
         "$AGTERMCTL" pick --prompt "$prompt" --allow-custom 2>/dev/null |
@@ -552,8 +599,16 @@ case "${1:-}" in
         # shell's OSC title (marked "⧉" by the snippet install.sh adds to the
         # remote ~/.bashrc), so it stays dynamic. CC_REMOTE_PANE rides along, so
         # a claude started by hand in that shell still reports to this pane.
+        # With no directory: the host first (the default one on top), then a
+        # directory there. Each host's directories load while the host is picked.
         dir="${2:-}"
-        [ -n "$dir" ] || dir="$(pick_dir "new $NAME shell session in…")"
+        if [ -z "$dir" ]; then
+            { [ -n "$WANT_HOST" ] || ! multi_host; } || prefetch_dirs
+            choose_host "new shell session on…" || { echo "cancelled" >&2; exit 0; }
+            await_dirs
+            dir="$(pick_dir "new $NAME shell session in…" "$DIRS_FILE")"
+            rm -rf "${DIRS_TMP:-}"
+        fi
         [ -n "$dir" ] || { echo "cancelled" >&2; exit 0; }
         need_absolute "$dir"
 
@@ -562,7 +617,7 @@ case "${1:-}" in
                    jq -r '.result.id // empty')"
         [ -n "$pane_id" ] || die "could not create an agterm session (is agterm running?)"
         "$AGTERMCTL" session restore "$cmd" --target "$pane_id" >/dev/null 2>&1
-        echo "ssh session in $dir (pane $pane_id)"
+        echo "ssh session in $dir on $NAME (pane $pane_id)"
         ;;
     --stop-pane)
         # Bound to a chord inside an attached pane: stop the Claude session this
@@ -698,12 +753,19 @@ case "${1:-}" in
     --new)
         # The durable, `claude agents`-managed variant. Fullscreen while attached.
         # With no directory, pick one, with a typed path as the fallback.
+        # With no directory, the host first, as for --shell.
         dir="${2:-}"
-        [ -n "$dir" ] || dir="$(pick_dir "new $NAME Claude Code session in…")"
+        if [ -z "$dir" ]; then
+            { [ -n "$WANT_HOST" ] || ! multi_host; } || prefetch_dirs
+            choose_host "new Claude Code session on…" || { echo "cancelled" >&2; exit 0; }
+            await_dirs
+            dir="$(pick_dir "new $NAME Claude Code session in…" "$DIRS_FILE")"
+            rm -rf "${DIRS_TMP:-}"
+        fi
         [ -n "$dir" ] || { echo "cancelled" >&2; exit 0; }
         need_absolute "$dir"
         cc_id="$(ssh "$HOST" "${RPATH}cd $(q "$dir") && claude --bg" 2>/dev/null | bg_id)"
-        [ -n "$cc_id" ] || die "could not start a background session in $dir"
+        [ -n "$cc_id" ] || die "could not start a background session in $dir on $NAME"
         open_pane "$cc_id" "$(basename "$dir")"
         ;;
     "")
