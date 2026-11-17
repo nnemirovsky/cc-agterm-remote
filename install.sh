@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Install cc-agterm-remote on this Mac and on the server named in
+# Install cc-agterm-remote on this Mac and on the servers named in
 # ~/.config/cc-agterm-remote/config. Run it again after pulling a new version.
 #
 #   ./install.sh                 install both sides
 #   ./install.sh --mac           only this Mac
-#   ./install.sh --server        only the server
+#   ./install.sh --server        only the servers
+#   ./install.sh --host H        of the servers, only H (with or without --server)
 #   ./install.sh uninstall       remove both sides (add --mac or --server for one)
 #
 # On the Mac: the scripts into ~/.local/bin, two launchd agents (the bridge and
@@ -17,15 +18,17 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-action=install mac=1 server=1
-for a in "$@"; do
-    case "$a" in
-        install|uninstall) action="$a" ;;
+action=install mac=1 server=1 only=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        install|uninstall) action="$1" ;;
         --mac) server=0 ;;
         --server) mac=0 ;;
-        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "unknown argument: $a (see --help)" >&2; exit 2 ;;
+        --host) only="${2:-}"; mac=0; shift ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
     esac
+    shift
 done
 
 say() { printf '%s\n' "$*"; }
@@ -35,13 +38,22 @@ CONF="${CC_REMOTE_CONFIG:-$HOME/.config/cc-agterm-remote/config}"
 if [ ! -f "$CONF" ]; then
     mkdir -p "$(dirname "$CONF")"
     cp "$here/config.example" "$CONF"
-    die "wrote $CONF from config.example: set CC_REMOTE_HOST there, then run this again"
+    die "wrote $CONF from config.example: set CC_REMOTE_HOSTS there, then run this again"
 fi
 # shellcheck source=/dev/null
 . "$CONF"
-HOST="${CC_REMOTE_HOST:-}"
-NAME="${CC_REMOTE_NAME:-$HOST}"
-[ -n "$HOST" ] || die "set CC_REMOTE_HOST in $CONF"
+# The servers, as in mac/bin/cc-remote-config: CC_REMOTE_HOSTS, or the single
+# CC_REMOTE_HOST of an older configuration.
+if [ -n "${CC_REMOTE_HOSTS+x}" ]; then
+    HOSTS=("${CC_REMOTE_HOSTS[@]}")
+elif [ -n "${CC_REMOTE_HOST:-}" ]; then
+    HOSTS=("$CC_REMOTE_HOST")
+else
+    die "set CC_REMOTE_HOSTS in $CONF"
+fi
+if [ -n "$only" ]; then
+    case " ${HOSTS[*]} " in *" $only "*) HOSTS=("$only") ;; *) die "$only is not in CC_REMOTE_HOSTS" ;; esac
+fi
 
 BIN="$HOME/.local/bin"
 STATE="$HOME/.config/cc-agterm-remote"
@@ -90,7 +102,7 @@ mac_install() {
     strip_block "$KEYMAP" cc-agterm-remote
     {
         printf '# >>> cc-agterm-remote >>>\n'
-        sed -n '/^command /p' "$here/mac/keymap.conf" | sed -e "s|@BIN@|$BIN|g" -e "s|@NAME@|$NAME|g"
+        sed -n '/^command /p' "$here/mac/keymap.conf" | sed -e "s|@BIN@|$BIN|g"
         printf '# <<< cc-agterm-remote <<<\n'
     } >> "$KEYMAP"
     # agterm keeps the old bindings until told to re-read the file, and a
@@ -115,6 +127,7 @@ mac_uninstall() {
 
 # The server side runs as one script over ssh, after the files are copied.
 server_install() {
+    local HOST="$1"
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null ||
         die "cannot ssh to $HOST without a prompt; set up key-based access first"
 
@@ -227,6 +240,7 @@ EOS
 }
 
 server_uninstall() {
+    local HOST="$1"
     ssh "$HOST" "bash -s --$(printf ' %q' "${SERVER_BIN[@]}")" <<'EOS' || die "the server side failed on $HOST"
 set -uo pipefail
 bin="$HOME/.local/bin"
@@ -260,13 +274,22 @@ EOS
 
 if [ "$action" = install ]; then
     [ "$mac" = 1 ] && mac_install
-    [ "$server" = 1 ] && server_install
+    # One server failing (down, say) leaves the others to be installed.
+    if [ "$server" = 1 ]; then
+        failed=""
+        for h in "${HOSTS[@]}"; do ( server_install "$h" ) || failed="$failed $h"; done
+        [ -z "$failed" ] || die "the server side failed on:$failed (./install.sh --host <host> to retry one)"
+    fi
     say ""
     say "Optional: the rename-session plugin lets Claude name its own session. On both machines:"
     say "  claude plugin marketplace add nnemirovsky/cc-agterm-remote"
     say "  claude plugin install rename-session@cc-agterm-remote"
 else
     [ "$mac" = 1 ] && mac_uninstall
-    [ "$server" = 1 ] && server_uninstall
+    if [ "$server" = 1 ]; then
+        failed=""
+        for h in "${HOSTS[@]}"; do ( server_uninstall "$h" ) || failed="$failed $h"; done
+        [ -z "$failed" ] || die "the server side failed on:$failed"
+    fi
 fi
 exit 0
