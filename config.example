@@ -19,6 +19,16 @@ CC_REMOTE_HOSTS=(devbox)
 # the host. (CC_REMOTE_NAME still names the single CC_REMOTE_HOST.)
 #CC_REMOTE_NAMES=("devbox=dev box")
 
+# The mark that leads a host's pane names in agterm's sidebar ("ⓣ ✳ <session>",
+# "ⓣ ~/dir" for a shell), as "host=mark". With one host the mark is "⧉". With
+# several, each host gets the circled first letter of its name ("torvalds" ⓣ,
+# "ritchie" ⓡ), or its next letter when an earlier host took that one, or "⧉"
+# and its first letter when none is left. Set them here for another style, such
+# as "⧉t". A mark is one word without quotes, backslashes, $, ` or !. The
+# server's shells carry theirs in their title, so run ./install.sh again after
+# changing one.
+#CC_REMOTE_MARKS=("devbox=⧉d" "buildbox=⧉b")
+
 # Where the "new session" picker looks for git repositories on the chosen
 # server, up to three levels deep. Relative to the remote home, or absolute.
 #CC_REMOTE_ROOTS=(dev src)

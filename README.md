@@ -10,7 +10,8 @@ What you get on the Mac:
   up its worktree; start a new one in a directory picked from the server; open a plain shell. With
   several servers the pickers list the sessions of all of them.
 - **The agent-status glyph on remote panes**, the same busy / waiting / done dot agterm shows for a
-  local session, and Claude's own session name as the pane name.
+  local session, and Claude's own session name as the pane name, after a mark that says which
+  server the pane is on.
 - **Ctrl+V pastes a Mac clipboard image** into a remote Claude Code prompt, and Claude's own copy
   goes to the Mac clipboard.
 - **Links clicked in a remote session open in the Mac's browser.**
@@ -49,6 +50,7 @@ The configuration (`config.example` has every key):
 ```bash
 CC_REMOTE_HOSTS=(devbox buildbox)     # the ssh hosts; the first is the default for new sessions
 CC_REMOTE_NAMES=("devbox=dev box")    # what pickers call a host (default: the host)
+CC_REMOTE_MARKS=("devbox=⧉d")         # what leads its pane names (default: see "Pane names")
 CC_REMOTE_ROOTS=(dev src)             # where the new-session picker looks for repos
 CC_REMOTE_DIRS=("dev/work=work root") # extra picker rows, path=label
 ```
@@ -113,18 +115,43 @@ supervisor retires idle ones after about an hour without losing them: they show 
 - **Headless runs** (`claude --print`, such as the reviewers a review tool starts inside a session)
   are left out of the pickers, although `claude agents` lists them.
 - **Plain shells** (`cmd+shift+s`) follow the remote shell's title, which the `~/.bashrc` block marks
-  `⧉ ~/dir`. A `claude` started by hand in one still reports to its pane, through `CC_REMOTE_PANE`.
+  with the server's mark, `⧉ ~/dir`. A `claude` started by hand in one still reports to its pane,
+  through `CC_REMOTE_PANE`.
+
+## Pane names
 
 Remote panes are named `⧉ ✳ <session name>`: `⧉` marks remote, `✳` marks Claude. The bridge
 relabels a pane when Claude names its session.
+
+With several servers the mark also says which server: each gets the circled first letter of its
+name, so with `CC_REMOTE_HOSTS=(torvalds ritchie)` panes read `ⓣ ✳ <session name>` and
+`ⓡ ✳ <session name>`, and shells `ⓣ ~/dir`. When two servers share a first letter, the later one
+takes the next letter of its name that is still free (`tesla` after `torvalds` is `ⓔ`), and a
+server with no letter left gets `⧉` and its first letter. `CC_REMOTE_MARKS` picks them yourself,
+in any style:
+
+```bash
+CC_REMOTE_MARKS=("torvalds=⧉t" "ritchie=⧉r")
+```
+
+A mark is one word without quotes, backslashes, `$`, `` ` `` or `!`; `install.sh` refuses another.
+The session pickers open with a legend row (`ⓣ torvalds · ⓡ ritchie`) and lead each session with
+its server's mark and name, and the new-session and new-shell server picker lists each server
+after its mark. `cc-remote-bridge --once` prints the marks too.
+
+The Mac names Claude panes, so a changed mark reaches them on its own: the bridge renames every
+attached pane to its server's current mark within a minute, panes named `⧉ ✳ …` before there were
+marks included. A shell's title comes from the server's `~/.bashrc`, so after changing the marks
+(or adding a server) run `./install.sh` again for the servers, and shells opened before that keep
+their old mark until they are reopened.
 
 ## Several servers
 
 List them in `CC_REMOTE_HOSTS`. Everything else follows:
 
-- **The pickers ask every server at once** and lead each row with its host. A server that does not
-  answer within `CC_REMOTE_CONNECT_TIMEOUT` seconds (5) shows as an `unavailable` row; the others
-  list as usual.
+- **The pickers ask every server at once** and lead each row with its host's mark and name (see
+  "Pane names"). A server that does not answer within `CC_REMOTE_CONNECT_TIMEOUT` seconds (5)
+  shows as an `unavailable` row; the others list as usual.
 - **Every action goes to the session's own server**: attach, restart, resume, kill, clean up, take
   over, the stop chord, and `cmd+shift+v` / `cmd+shift+i`, which find the server in the pane's ssh
   command. `cc-remote-attach <host>:<id>` names one from a terminal; a bare id is looked up on
@@ -148,7 +175,9 @@ CC_REMOTE_HOST=oldbox                 # the server older panes run on
 
 To add a server, put it in `CC_REMOTE_HOSTS` and run `./install.sh --host <host>` for its server
 side, then `./install.sh --mac` (or reload the bridge:
-`launchctl kickstart -k gui/$(id -u)/cc-agterm-remote.bridge`) so the bridge connects to it.
+`launchctl kickstart -k gui/$(id -u)/cc-agterm-remote.bridge`) so the bridge connects to it. Going
+from one server to two changes the first one's mark from `⧉` too, as does putting a new server
+ahead of one whose letter it shares: then run `./install.sh --server` for all of them.
 Remote-control servers (`claude-rc add`) are per server; the app lists them as `<host>-<name>`.
 
 ## How the pieces fit
