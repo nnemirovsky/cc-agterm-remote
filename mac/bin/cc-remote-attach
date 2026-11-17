@@ -16,6 +16,13 @@
 #                                    that pane, optionally removing its worktree and branch
 #   cc-remote-attach --list          print the remote sessions and exit
 #
+# With several servers (CC_REMOTE_HOSTS) the pickers list the sessions of every
+# one, each row named with its host, and act on the host the picked session
+# lives on. --host <host>, first, fixes the host: of a new session or shell
+# (which otherwise asks, defaulting to the first host), of --direct, or of an
+# <id> for attach and --restart, which can also be given as <host>:<id>; an id
+# alone is looked up on every host.
+#
 # "Clean up" removes the linked worktree a session runs in together with its branch,
 # or, in a repo's main checkout, switches to the default branch and deletes the
 # session's branch. It is offered only when nothing would be lost: no uncommitted
@@ -38,6 +45,18 @@ die() {
     exit 1
 }
 
+# What the pickers that span every host call them.
+SCOPE="$NAME"
+multi_host && SCOPE="remote"
+
+WANT_HOST=""
+if [ "${1:-}" = "--host" ]; then
+    WANT_HOST="${2:?usage: cc-remote-attach --host <host> <command>}"
+    is_host "$WANT_HOST" || die "$WANT_HOST is not in CC_REMOTE_HOSTS"
+    use_host "$WANT_HOST"
+    shift 2
+fi
+
 # Put first in every remote command: a non-interactive ssh shell may not have
 # ~/.local/bin, where Claude Code's native installer puts `claude`, on its PATH.
 RPATH='export PATH="$HOME/.local/bin:$PATH"; '
@@ -50,7 +69,7 @@ q() { printf '%q' "$1"; }
 rbash() {
     local args=""
     [ $# -gt 0 ] && args="$(printf ' %q' "$@")"
-    ssh "$HOST" "bash -s --$args"
+    ssh "${SSH_QUICK[@]}" "$HOST" "bash -s --$args"
 }
 
 # Defined on the server ahead of a script that lists sessions. `claude agents`
@@ -91,6 +110,63 @@ m=$(find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -printf '%f\t%T@\n
 jq --argjson m "${m:-{\}}" 'map(. + {active: ($m[.sessionId // ""] // ((.startedAt // 0) / 1000))})' <<<"$s"
 EOS
     } | rbash 2>/dev/null
+}
+
+# `claude agents --json --all` as it is, headless runs included.
+agents_all() {
+    ssh "${SSH_QUICK[@]}" "$HOST" "${RPATH}claude agents --json --all" 2>/dev/null
+}
+
+# Session query $1 (remote_sessions, all_sessions or agents_all) run on every
+# configured host at once, as one array with each row's `host` added. A host
+# that does not answer in time (a dead one fails within CC_REMOTE_CONNECT_TIMEOUT,
+# a hung one is cut off after CC_REMOTE_LIST_TIMEOUT, 20 s) adds a
+# {kind: "unreachable", host} row instead, so one server being down neither
+# holds up nor empties a picker.
+everywhere() {
+    local query="$1" dir h i=0 out
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-remote-attach.XXXXXX")" || return 1
+    for h in "${HOSTS[@]}"; do
+        ( use_host "$h"; deadline "${CC_REMOTE_LIST_TIMEOUT:-20}" "$query" > "$dir/$i" ) &
+        i=$((i + 1))
+    done
+    wait
+    i=0
+    for h in "${HOSTS[@]}"; do
+        if [ -s "$dir/$i" ] &&
+           out="$(jq -c --arg h "$h" 'if type == "array" then map(. + {host: $h}) else error end' "$dir/$i" 2>/dev/null)"; then
+            printf '%s\n' "$out"
+        else
+            jq -nc --arg h "$h" '[{kind: "unreachable", host: $h}]'
+        fi
+        i=$((i + 1))
+    done | jq -s -c 'add // []'
+    rm -rf "$dir"
+}
+
+# The hosts that did not answer, from everywhere's output on stdin, as "a, b".
+unreachable() {
+    jq -r '[.[] | select(.kind == "unreachable") | .host] | join(", ")'
+}
+
+# Point HOST at the server session $1 runs on, and set CC_ID to its id. A
+# "<host>:<id>" names the host itself, as does --host; otherwise every host is
+# asked and the one running it wins. Fails when none runs it, leaving HOST at
+# the default; dies when several do.
+locate_session() {
+    local ref="$1" found
+    CC_ID="$ref"
+    case "$ref" in
+        *:*) if is_host "${ref%:*}"; then use_host "${ref%:*}"; CC_ID="${ref##*:}"; return 0; fi ;;
+    esac
+    { [ -n "$WANT_HOST" ] || ! multi_host; } && return 0
+    found="$(everywhere remote_sessions |
+             jq -r --arg i "$ref" '[.[] | select(.id == $i) | .host] | unique | .[]')"
+    case "$(grep -c . <<<"$found")" in
+        0) return 1 ;;
+        1) use_host "$found" ;;
+        *) die "session $ref runs on $(paste -sd, - <<<"$found"): name one, as <host>:$ref" ;;
+    esac
 }
 
 # What stopping a session could also clean up, judged in its working directory on
@@ -190,27 +266,51 @@ EOS
 # `claude attach` reopens with the conversation intact. "Stopped" means no
 # process (`pid` absent): `state` alone is not enough, since a session the
 # supervisor retired reads "done" but one stopped by hand reads "stopped".
-# A stopped session the app has already resumed (same sessionId) is hidden
-# behind its "from app" row. Stopped sessions list most recently active first
-# (`active`, from all_sessions).
+# A stopped session that runs again (same sessionId), resumed by the app or
+# moved to another host, is hidden behind its live row, and one stopped on
+# several hosts shows once, where it was active last. Stopped sessions list
+# most recently active first (`active`, from all_sessions).
+#
+# The input comes from `everywhere`: each row carries its `host`, which leads
+# its label when there are several hosts and is part of its id
+# ("bg:<host>:<id>", "app:<host>:<uuid>"; see split_choice). A host that did not
+# answer gets an "unavailable" row ("down:<host>") above the stopped ones.
 SEP_ID="sep"
 picker_rows() {
-    jq -c '
+    jq -c --argjson multi "$(multi_host && echo true || echo false)" --argjson names "$(host_labels_json)" '
         def running: .kind == "background" and has("pid");
         def stopped: .kind == "background" and (has("pid") | not);
+        def app: .kind != "background" and .kind != "unreachable";
         def order: if .state == "blocked" then 0 elif .state == "working" then 1 else 2 end;
         def badge: if .state == "working" then "busy"
                    elif .state == "blocked" then "waiting"
                    else (.status // .state // "?") end;
-        ([.[] | select(.kind == "interactive") | .sessionId]) as $app
+        def host_tag: if $multi then "\($names[.host] // .host) · " else "" end;
+        ([.[] | select(running or app) | .sessionId]) as $live
         | ([.[] | select(running)] | sort_by(order)
-           | map({id: ("bg:" + .id), label: ("\(badge) · \(.name // .id)"), subtitle: .cwd}))
-        + [.[] | select(.kind != "background")
-           | {id: ("app:" + .sessionId), label: ("from app · \(.name)"), subtitle: .cwd}]
-        + ([.[] | select(stopped and (.sessionId | IN($app[]) | not))] | sort_by(-(.active // 0))
+           | map({id: "bg:\(.host):\(.id)", label: "\(host_tag)\(badge) · \(.name // .id)", subtitle: .cwd}))
+        + [.[] | select(app)
+           | {id: "app:\(.host):\(.sessionId)", label: "\(host_tag)from app · \(.name)", subtitle: .cwd}]
+        + [.[] | select(.kind == "unreachable")
+           | {id: "down:\(.host)", label: "\($names[.host] // .host) · unavailable",
+              subtitle: "ssh \(.host) did not answer, so its sessions are missing"}]
+        + ([.[] | select(stopped and (.sessionId | IN($live[]) | not))]
+           | group_by(.sessionId) | map(max_by(.active // 0)) | sort_by(-(.active // 0))
            | if length == 0 then [] else
                [{id: "'"$SEP_ID"'", label: "──────── stopped · pick to resume ────────"}]
-               + map({id: ("bg:" + .id), label: (.name // .id), subtitle: .cwd}) end)'
+               + map({id: "bg:\(.host):\(.id)", label: "\(host_tag)\(.name // .id)", subtitle: .cwd}) end)'
+}
+
+# Split a picker row id ("bg:<host>:<id>", "app:<host>:<uuid>") into KIND,
+# TARGET and the host, which it switches to. The id is the part after the last
+# colon, so a host may contain one. Fails for a separator or "unavailable" row.
+split_choice() {
+    local rest
+    KIND="${1%%:*}"
+    case "$KIND" in bg|app) ;; *) return 1 ;; esac
+    rest="${1#*:}"
+    TARGET="${rest##*:}"
+    use_host "${rest%:*}"
 }
 
 # Candidate working directories on the server. Every row starts the SAME thing —
@@ -282,38 +382,44 @@ pick_dir() {
     esac
 }
 
-# The command a pane runs for remote command $1 (see cc-remote-ssh); further
-# args go before it (--pane).
+# The command a pane runs for remote command $1 on HOST (see cc-remote-ssh);
+# further args go before it (--pane).
 pane_cmd() {
     local c
-    c="$(q "$BIN/cc-remote-ssh")"
+    c="$(q "$BIN/cc-remote-ssh") --host $(q "$HOST")"
     while [ $# -gt 1 ]; do c="$c $1"; shift; done
     printf '%s %s' "$c" "$(q "$RPATH$1")"
 }
 
 register() {
     # Hooks report the session UUID; `claude agents`/`attach` use the short id.
-    # Map both so the bridge resolves a pane whichever one it sees.
-    local cc_id="$1" pane_id="$2" uuid tmp
+    # Map both so the bridge resolves a pane whichever one it sees, each under
+    # "<host>:" (map_key), since a session moved between hosts keeps its ids. A
+    # legacy entry without a host for the same session goes.
+    local cc_id="$1" pane_id="$2" uuid tmp bare=false
+    [ "$HOST" = "$LEGACY_HOST" ] && bare=true
     uuid="$(remote_sessions | jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .sessionId // empty')"
     tmp="$(mktemp)"
-    jq --arg s "$cc_id" --arg u "$uuid" --arg t "$pane_id" \
-       '.[$s] = $t | (if ($u | length) > 0 then .[$u] = $t else . end)' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+    jq --arg h "$(map_key "$HOST" "")" --arg s "$cc_id" --arg u "$uuid" --arg t "$pane_id" --argjson bare "$bare" \
+       '(if $bare then del(.[$s], .[$u]) else . end)
+        | .[$h + $s] = $t | (if ($u | length) > 0 then .[$h + $u] = $t else . end)' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
     [ -n "$uuid" ] && echo "  mapped uuid $uuid" >&2
 }
 
 kill_session() {
     # Stop the process only. The job stays in ~/.claude/jobs, so the session
     # moves under the picker's "stopped" separator and can be resumed later.
-    local cc_id="$1" pane tmp
+    local cc_id="$1" pane tmp bare=false
     ssh "$HOST" "${RPATH}claude stop $(q "$cc_id")" 2>&1 | tail -1
 
     # Close its pane and drop it from the bridge map, if it had one.
-    pane="$(jq -r --arg s "$cc_id" '.[$s] // empty' "$MAP" 2>/dev/null)"
+    pane="$(map_pane "$HOST" "$cc_id")"
     [ -n "$pane" ] && "$AGTERMCTL" session close --target "$pane" >/dev/null 2>&1
+    [ "$HOST" = "$LEGACY_HOST" ] && bare=true
     tmp="$(mktemp)"
-    jq --arg s "$cc_id" 'with_entries(select(.key | startswith($s) | not))' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
-    echo "stopped $cc_id"
+    jq --arg k "$(map_key "$HOST" "$cc_id")" --arg s "$cc_id" --argjson bare "$bare" \
+       'with_entries(select(.key | (startswith($k) or ($bare and startswith($s))) | not))' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+    echo "stopped $cc_id on $NAME"
 }
 
 # Pull the background id out of what `claude --bg` prints.
@@ -369,7 +475,7 @@ pane_exists() {
 # short id would fork a copy.
 restart_session() {
     local cc_id="$1" uuid="$2" dir="$3" how="$4" old new_id base place=()
-    old="$(jq -r --arg s "$cc_id" '.[$s] // empty' "$MAP" 2>/dev/null)"
+    old="$(map_pane "$HOST" "$cc_id")"
     # A pane whose attach ends with the session closes on its own (one agterm
     # restored at launch has no --wait), so note its place before stopping.
     [ -n "$old" ] && while IFS= read -r a; do place+=("$a"); done < <(pane_place "$old")
@@ -416,7 +522,7 @@ open_pane() {
     # Further args, optional, place the pane (--after/--before <pane>,
     # --workspace <id>): where the one a restart replaces was.
     local cc_id="$1" label="$2" pane_id cc_name cmd place=("${@:3}")
-    cc_name="$(ssh "$HOST" "${RPATH}claude agents --json --all" 2>/dev/null |
+    cc_name="$(agents_all |
                 jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .name // empty' | head -1)"
     [ -n "$cc_name" ] && [ "$cc_name" != "$cc_id" ] || cc_name="$label"
     # "⧉ ✳ " marks a remote Claude pane. See the bridge's sync_names for why the
@@ -433,7 +539,7 @@ open_pane() {
 
     register "$cc_id" "$pane_id"
     "$AGTERMCTL" session restore "$cmd" --target "$pane_id" >/dev/null 2>&1
-    echo "attached $cc_id in agterm session $pane_id"
+    echo "attached $cc_id ($NAME) in agterm session $pane_id"
 }
 
 need_absolute() {
@@ -465,13 +571,19 @@ case "${1:-}" in
         # bridge map resolves it back to the background id. A pane opened by
         # --direct or --shell has no background id, so it is refused rather than
         # guessed at.
+        # The map key says which host: "<host>:<id>", or a bare legacy "<id>",
+        # whose host the pane's own ssh command names (pane_host).
         pane="${2:-${AGT_SESSION_ID:-${AGTERM_SESSION_ID:-}}}"
         [ -n "$pane" ] || die "no agterm pane id (run from a chord, or pass the pane id)"
-        cc_id="$(jq -r --arg p "$pane" 'to_entries[] | select(.value == $p) | .key | select(test("^[0-9a-f]{8}$"))' "$MAP" 2>/dev/null | head -1)"
-        [ -n "$cc_id" ] || die "this pane is not an attached $NAME Claude Code session"
+        key="$(jq -r --arg p "$pane" 'to_entries[] | select(.value == $p) | .key | select(test("(^|:)[0-9a-f]{8}$"))' "$MAP" 2>/dev/null | head -1)"
+        [ -n "$key" ] || die "this pane is not an attached $SCOPE Claude Code session"
+        case "$key" in
+            *:*) use_host "${key%:*}"; cc_id="${key##*:}" ;;
+            *) use_host "$(pane_host "$pane")"; cc_id="$key" ;;
+        esac
         sessions="$(remote_sessions)"
         row="$(jq -c --arg i "$cc_id" '.[] | select(.id == $i)' <<<"$sessions" | head -1)"
-        [ -n "$row" ] || die "session $cc_id is not running on $HOST"
+        [ -n "$row" ] || die "session $cc_id is not running on $NAME"
         name="$(jq -r '.name // empty' <<<"$row")"
         dir="$(jq -r '.cwd // empty' <<<"$row")"
         info="$(cleanup_info "$dir")"
@@ -495,28 +607,32 @@ case "${1:-}" in
         # later) and the remote-control servers' own interactive sessions (no
         # id, so killed by pid). Sessions the phone spawned INSIDE an rc server
         # live in that server's process and appear only in the Claude app.
-        sessions="$(remote_sessions)"
+        sessions="$(everywhere remote_sessions)"
         items="$(picker_rows <<<"$sessions" 2>/dev/null)"
-        [ "$(jq -r 'length' <<<"$items" 2>/dev/null)" != "0" ] || die "no running sessions on $HOST"
+        if [ "$(jq -r '[.[] | select(.kind != "unreachable")] | length' <<<"$sessions")" = "0" ]; then
+            down="$(unreachable <<<"$sessions")"
+            die "no running sessions on $SCOPE servers${down:+ (no answer from $down)}"
+        fi
 
-        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "kill which $NAME Claude Code session?" 2>/dev/null |
+        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "kill which $SCOPE Claude Code session?" 2>/dev/null |
                   jq -r 'select(.result == "picked") | .id // empty')"
-        [ -n "$choice" ] || { echo "cancelled" >&2; exit 0; }
+        split_choice "$choice" || { echo "cancelled" >&2; exit 0; }
 
-        target="${choice#*:}"
-        if [ "${choice%%:*}" = "app" ]; then
-            row="$(jq -c --arg s "$target" '.[] | select(.sessionId == $s)' <<<"$sessions")"
+        target="$TARGET"
+        if [ "$KIND" = "app" ]; then
+            row="$(jq -c --arg h "$HOST" --arg s "$target" '.[] | select(.host == $h and .sessionId == $s)' <<<"$sessions")"
             label="app session $(jq -r '.name' <<<"$row")"
         else
-            label="$(jq -r --arg i "$target" '.[] | select(.id == $i) | .name' <<<"$sessions")"
+            label="$(jq -r --arg h "$HOST" --arg i "$target" '.[] | select(.host == $h and .id == $i) | .name' <<<"$sessions")"
         fi
+        multi_host && label="$label on $NAME"
 
         confirm="$(printf '%s\n' "cancel" "kill $label" |
                    "$AGTERMCTL" pick --prompt "confirm" 2>/dev/null |
                    jq -r 'select(.result == "picked") | .id // empty')"
         case "$confirm" in kill*) ;; *) echo "cancelled" >&2; exit 0 ;; esac
 
-        if [ "${choice%%:*}" = "app" ]; then
+        if [ "$KIND" = "app" ]; then
             # The rc server stays up and will make a new session on demand.
             pid="$(jq -r '.pid // empty' <<<"$row")"
             case "$pid" in ''|*[!0-9]*) die "no process id for $label" ;; esac
@@ -529,14 +645,21 @@ case "${1:-}" in
     --restart)
         # What the pickers' "restart" does, without a picker: for a script, or a
         # session that should come back after a plugin or settings change.
-        cc_id="${2:?usage: cc-remote-attach --restart <id>}"
+        locate_session "${2:?usage: cc-remote-attach [--host <host>] --restart [<host>:]<id>}" ||
+            die "session $2 is not running on any $SCOPE server"
+        cc_id="$CC_ID"
         row="$(remote_sessions | jq -c --arg i "$cc_id" '.[] | select(.id == $i)' | head -1)"
-        [ -n "$row" ] || die "session $cc_id is not running on $HOST"
+        [ -n "$row" ] || die "session $cc_id is not running on $NAME"
         restart_session "$cc_id" "$(jq -r '.sessionId' <<<"$row")" "$(jq -r '.cwd' <<<"$row")" restarted
         ;;
     --list)
-        ssh "$HOST" "${RPATH}claude agents --json --all" 2>/dev/null |
-            jq -r '.[] | "\(.id // "-")\t\(.kind)\t\(.state // .status // "-")\t\(.name)\t\(.cwd)"'
+        # One line per session, the host first; a host that did not answer is
+        # named on stderr.
+        sessions="$(everywhere agents_all)"
+        jq -r '.[] | select(.kind != "unreachable")
+               | "\(.host)\t\(.id // "-")\t\(.kind)\t\(.state // .status // "-")\t\(.name)\t\(.cwd)"' <<<"$sessions"
+        down="$(unreachable <<<"$sessions")"
+        [ -z "$down" ] || echo "no answer from $down" >&2
         exit 0
         ;;
     --direct)
@@ -566,7 +689,7 @@ case "${1:-}" in
 
         if [ -n "$uuid" ]; then
             tmp="$(mktemp)"
-            jq --arg u "$uuid" --arg t "$pane_id" '.[$u] = $t' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
+            jq --arg k "$(map_key "$HOST" "$uuid")" --arg t "$pane_id" '.[$k] = $t' "$MAP" > "$tmp" && mv "$tmp" "$MAP"
             echo "started $slug ($uuid) in agterm session $pane_id"
         else
             echo "pane $pane_id opened, but no session id appeared — status glyphs will not track it" >&2
@@ -587,25 +710,27 @@ case "${1:-}" in
         # Pick a session, then pick what to do with it. Background sessions are
         # attached by id; an app-started one is taken over first (see
         # takeover_pane) because `claude attach` needs a background id.
-        sessions="$(all_sessions)"
+        sessions="$(everywhere all_sessions)"
         items="$(picker_rows <<<"$sessions" 2>/dev/null)"
-        if [ "$(jq -r 'length' <<<"$items")" = "0" ]; then
-            die "no sessions on $HOST"
+        if [ "$(jq -r '[.[] | select(.kind != "unreachable")] | length' <<<"$sessions")" = "0" ]; then
+            down="$(unreachable <<<"$sessions")"
+            die "no sessions on $SCOPE servers${down:+ (no answer from $down)}"
         fi
         # pick prints {"id":…,"result":"picked","label":…}; `result` is a string,
-        # so index only `.id`, and treat anything but "picked" as a cancel.
-        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "$NAME Claude Code sessions" 2>/dev/null |
+        # so index only `.id`, and treat anything but "picked" as a cancel. The
+        # separator and "unavailable" rows cancel too.
+        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "$SCOPE Claude Code sessions" 2>/dev/null |
                   jq -r 'select(.result == "picked") | .id // empty')"
-        [ -n "$choice" ] && [ "$choice" != "$SEP_ID" ] || { echo "cancelled" >&2; exit 0; }
+        split_choice "$choice" || { echo "cancelled" >&2; exit 0; }
 
-        kind="${choice%%:*}"
-        target="${choice#*:}"
+        kind="$KIND"
+        target="$TARGET"
         info='{"kind":"none"}'
         if [ "$kind" = "app" ]; then
-            row="$(jq -c --arg s "$target" '.[] | select(.sessionId == $s)' <<<"$sessions")"
+            row="$(jq -c --arg h "$HOST" --arg s "$target" '.[] | select(.host == $h and .sessionId == $s)' <<<"$sessions")"
             actions=("attach (takes it over from the app)" "kill" "cancel")
         else
-            row="$(jq -c --arg i "$target" '.[] | select(.id == $i)' <<<"$sessions")"
+            row="$(jq -c --arg h "$HOST" --arg i "$target" '.[] | select(.host == $h and .id == $i)' <<<"$sessions")"
             info="$(cleanup_info "$(jq -r '.cwd' <<<"$row")")"
             # A stopped session has no process to kill; it is resumed instead.
             if [ "$(jq -r 'has("pid")' <<<"$row")" != "true" ]; then
@@ -620,8 +745,10 @@ case "${1:-}" in
         # Attach first, so a stray Enter does the safe thing. agterm has no "back"
         # into a previous picker, so the last option just cancels. "@cleanup:<verb>"
         # stands for the clean-up row, left out when there is nothing to clean up.
+        prompt="$name"
+        multi_host && prompt="$name ($NAME)"
         action="$(action_items "$info" "${actions[@]}" |
-                  "$AGTERMCTL" pick --prompt "$name" 2>/dev/null |
+                  "$AGTERMCTL" pick --prompt "$prompt" 2>/dev/null |
                   jq -r 'select(.result == "picked") | .id // empty')"
 
         case "$action" in
@@ -656,13 +783,16 @@ case "${1:-}" in
         esac
         ;;
     -h|--help)
-        sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     -*)
         die "unknown option: $1 (see --help)"
         ;;
     *)
-        cc_id="$1"
+        # On the host that runs it; one that runs nowhere is tried on the
+        # default host (it may be stopped, which `claude attach` reports).
+        locate_session "$1"
+        cc_id="$CC_ID"
         label="$(remote_sessions | jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .cwd' | xargs basename 2>/dev/null)"
         open_pane "$cc_id" "${label:-$cc_id}"
         ;;
