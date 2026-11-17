@@ -573,10 +573,9 @@ open_pane() {
     cc_name="$(agents_all |
                 jq -r --arg i "$cc_id" '.[] | select(.id == $i) | .name // empty' | head -1)"
     [ -n "$cc_name" ] && [ "$cc_name" != "$cc_id" ] || cc_name="$label"
-    # "⧉ ✳ " marks a remote Claude pane. See the bridge's sync_names for why the
-    # glyph is static rather than the animated one Claude puts in its OSC title.
-    cc_name="${cc_name#[✳◐◑◒◓✶✻✽*] }"
-    case "$cc_name" in "⧉ "*) ;; *) cc_name="⧉ ✳ $cc_name" ;; esac
+    # "<host mark> ✳ " marks a remote Claude pane and its server (pane_label in
+    # cc-remote-config).
+    cc_name="$(pane_label "$HOST" "$cc_name")"
 
     cmd="$(pane_cmd "claude attach $(q "$cc_id")")"
     pane_id="$("$AGTERMCTL" session new \
@@ -597,8 +596,8 @@ need_absolute() {
 case "${1:-}" in
     --shell)
         # A plain login shell on the server. The pane keeps following the remote
-        # shell's OSC title (marked "⧉" by the snippet install.sh adds to the
-        # remote ~/.bashrc), so it stays dynamic. CC_REMOTE_PANE rides along, so
+        # shell's OSC title (led by the host's mark, by the snippet install.sh
+        # adds to the remote ~/.bashrc), so it stays dynamic. CC_REMOTE_PANE rides along, so
         # a claude started by hand in that shell still reports to this pane.
         # With no directory: the host first (the default one on top), then a
         # directory there. Each host's directories load while the host is picked.
