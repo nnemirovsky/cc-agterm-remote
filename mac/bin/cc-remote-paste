@@ -4,6 +4,12 @@
 # same in a local session and in a remote one, where ctrl+v reaches the Mac
 # clipboard through the xclip stand-in.
 #
+# A chord pressed in the quick terminal reaches this script with the active
+# session's AGT_* values, so the visible quick panel is the only sign that it
+# fired there. agterm has no paste for the quick terminal, only typing, and a
+# typed newline is Return, so text with a line break is refused there rather
+# than run line by line.
+#
 # Bound in ~/.config/agterm/keymap.conf by install.sh:
 #   command "Paste (image to Claude Code)" cmd+v  ~/.local/bin/cc-remote-paste
 AGTERMCTL="${AGTERMCTL:-$(command -v agtermctl || echo /Applications/agterm.app/Contents/MacOS/agtermctl)}"
@@ -11,8 +17,30 @@ target="${AGT_SESSION_ID:-active}"
 pane=()
 [ -n "${AGT_PANE:-}" ] && pane=(--pane "$AGT_PANE")
 
-if [ -z "$(pbpaste 2>/dev/null | head -c 1)" ] &&
-   osascript -e 'clipboard info' 2>/dev/null | grep -qE 'PNGf|TIFF|JPEG|GIFf|«class PNGf»'; then
+image_only() {
+    [ -z "$(pbpaste 2>/dev/null | head -c 1)" ] &&
+        osascript -e 'clipboard info' 2>/dev/null | grep -qE 'PNGf|TIFF|JPEG|GIFf|«class PNGf»'
+}
+
+quick_visible() {
+    [ "$("$AGTERMCTL" tree --json 2>/dev/null | jq -r '.result.tree.quickVisible // false')" = true ]
+}
+
+if quick_visible; then
+    if image_only; then
+        exec "$AGTERMCTL" quick type "$(printf '\026')"
+    fi
+    text="$(pbpaste 2>/dev/null)" # $(...) drops trailing newlines
+    [ -n "$text" ] || exit 0
+    if [[ "$text" == *[$'\n\r']* ]]; then
+        exec "$AGTERMCTL" notify "Multi-line text can't be pasted into the quick terminal: each line would run as a command." \
+            --title "Paste refused"
+    fi
+    printf '%s' "$text" | "$AGTERMCTL" quick type --stdin
+    exit
+fi
+
+if image_only; then
     exec "$AGTERMCTL" session type --target "$target" "${pane[@]+"${pane[@]}"}" "$(printf '\026')"
 fi
 exec "$AGTERMCTL" session paste --target "$target"

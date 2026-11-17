@@ -77,7 +77,7 @@ claude plugin install rename-session@cc-agterm-remote
 | `cmd+shift+s` | New plain ssh shell on the server, same directory picker. |
 | `cmd+shift+v` | Paste a clipboard image by uploading it and typing its path (the fallback for Ctrl+V). |
 | `cmd+shift+i` | Show the image whose path is selected (or copied), from the Mac or the server. |
-| `cmd+v` | Paste as usual, but with only an image on the clipboard send Ctrl+V, which is how Claude Code pastes an image. |
+| `cmd+v` | Paste as usual, but with only an image on the clipboard send Ctrl+V, which is how Claude Code pastes an image. In the quick terminal it types single-line text and refuses multi-line text, since agterm can only type there and each line would run. |
 
 They also show up by name in agterm's Navigate ▸ Custom Commands (`ctrl+shift+O`). The same actions
 are available from a terminal: `cc-remote-attach --help`.
