@@ -51,6 +51,19 @@ elif [ -n "${CC_REMOTE_HOST:-}" ]; then
 else
     die "set CC_REMOTE_HOSTS in $CONF"
 fi
+# Each server's mark, which leads its panes' names on the Mac and which its
+# shells put in their title, derived as mac/bin/cc-remote-config derives it,
+# from the full host list, so --host gives a server the same mark as a full
+# install. A bad CC_REMOTE_MARKS entry stops the install.
+# shellcheck disable=SC2016 # the script expands its own arguments
+host_mark_of() {
+    CC_REMOTE_CONFIG="$CONF" "$BASH" -c '. "$1" && host_mark "$2"' _ "$here/mac/bin/cc-remote-config" "$1"
+}
+if [ "$action" = install ]; then
+    # shellcheck disable=SC2016
+    mark_errors="$(CC_REMOTE_CONFIG="$CONF" "$BASH" -c '. "$1" && printf %s "$MARK_ERRORS"' _ "$here/mac/bin/cc-remote-config")"
+    [ -z "$mark_errors" ] || die "$mark_errors"
+fi
 if [ -n "$only" ]; then
     case " ${HOSTS[*]} " in *" $only "*) HOSTS=("$only") ;; *) die "$only is not in CC_REMOTE_HOSTS" ;; esac
 fi
@@ -125,17 +138,14 @@ mac_uninstall() {
     say "removed the Mac side (kept $CONF, $STATE/map.json and $STATE/bridge.log)"
 }
 
-# The server side runs as one script over ssh, after the files are copied.
-server_install() {
-    local HOST="$1"
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null ||
-        die "cannot ssh to $HOST without a prompt; set up key-based access first"
-
-    COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -C "$here/server" -cf - bin systemd tmux.conf |
-        ssh "$HOST" 'rm -rf ~/.cache/cc-agterm-remote/install && mkdir -p ~/.cache/cc-agterm-remote/install && tar -C ~/.cache/cc-agterm-remote/install -xf -' ||
-        die "could not copy the server files to $HOST"
-
-    ssh "$HOST" "bash -s --$(printf ' %q' "${SERVER_BIN[@]}")" <<'EOS' || die "the server side failed on $HOST"
+# The server side's install script, for a server whose mark is $1. It runs
+# over ssh, after the files are copied, with the scripts to install as its
+# arguments. The mark comes first, as a line of its own rather than an
+# argument, so no remote login shell has to unquote it; it holds no quote (see
+# cc-remote-config).
+server_script() {
+    printf "mark='%s'\n" "$1"
+    cat <<'EOS'
 set -uo pipefail
 src="$HOME/.cache/cc-agterm-remote/install"
 bin="$HOME/.local/bin"
@@ -218,15 +228,17 @@ if [ "$(basename "${SHELL:-}")" = bash ]; then
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 EOF
     # agterm names a pane from the OSC title, so mark the title itself rather
-    # than renaming the pane, which would stop it following the title: "⧉"
-    # marks a remote shell, the rest follows the directory.
-    block "$HOME/.bashrc" cc-agterm-remote-title end <<'EOF'
-# Mark this machine's shells in agterm's sidebar: "⧉ ~/dir" (cc-agterm-remote).
-if [ -n "${SSH_CONNECTION:-}" ] && [ -n "${PS1:-}" ]; then
-    case "$TERM" in xterm*|rxvt*|screen*|tmux*) PS1="$PS1\[\e]0;⧉ \w\a\]" ;; esac
+    # than renaming the pane, which would stop it following the title: the
+    # server's mark says the shell is remote, and on which server, the rest
+    # follows the directory. Only "$" needs escaping here, "\[" and the like
+    # pass as they are.
+    block "$HOME/.bashrc" cc-agterm-remote-title end <<EOF
+# Mark this machine's shells in agterm's sidebar: "$mark ~/dir" (cc-agterm-remote).
+if [ -n "\${SSH_CONNECTION:-}" ] && [ -n "\${PS1:-}" ]; then
+    case "\$TERM" in xterm*|rxvt*|screen*|tmux*) PS1="\$PS1\[\e]0;$mark \w\a\]" ;; esac
 fi
 EOF
-    echo "  added BROWSER and the pane title mark to ~/.bashrc"
+    echo "  added BROWSER and the pane title mark ($mark) to ~/.bashrc"
 else
     echo "  note: your login shell is not bash, so set BROWSER=$bin/cc-remote-open yourself"
 fi
@@ -236,7 +248,22 @@ tmux source-file "$HOME/.tmux.conf" 2>/dev/null
 echo "  added OSC 8 link pass-through to ~/.tmux.conf"
 rm -rf "$src"
 EOS
-    say "installed the server side on $HOST"
+}
+
+server_install() {
+    local HOST="$1" mark
+    mark="$(host_mark_of "$HOST")"
+    case "$mark" in ""|*\'*) die "no usable mark for $HOST: '$mark'" ;; esac
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null ||
+        die "cannot ssh to $HOST without a prompt; set up key-based access first"
+
+    COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -C "$here/server" -cf - bin systemd tmux.conf |
+        ssh "$HOST" 'rm -rf ~/.cache/cc-agterm-remote/install && mkdir -p ~/.cache/cc-agterm-remote/install && tar -C ~/.cache/cc-agterm-remote/install -xf -' ||
+        die "could not copy the server files to $HOST"
+
+    server_script "$mark" | ssh "$HOST" "bash -s --$(printf ' %q' "${SERVER_BIN[@]}")" ||
+        die "the server side failed on $HOST"
+    say "installed the server side on $HOST (mark $mark)"
 }
 
 server_uninstall() {
