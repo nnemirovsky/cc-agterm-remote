@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Mac side of the agterm status bridge, run by launchd (cc-agterm-remote.bridge).
 #
-# Tails the server's ~/.cache/cc-agterm-remote/status.jsonl, which the
-# cc-remote-status hook appends to, over one persistent ssh connection, and
-# paints the agterm agent-status glyph on whichever local pane is showing that
-# remote session. The pane mapping is written by `cc-remote-attach`.
+# Tails each server's ~/.cache/cc-agterm-remote/status.jsonl, which the
+# cc-remote-status hook appends to, over one persistent ssh connection per
+# server, and paints the agterm agent-status glyph on whichever local pane is
+# showing that remote session. The pane mapping is written by
+# `cc-remote-attach`, keyed "<host>:<id>" (a bare id is the legacy host's, see
+# cc-remote-config). Each server's connection reconnects on its own, so one
+# that is down leaves the others alone.
 #
-# The same connection carries the Mac clipboard and link opening to the server:
-# it forwards the server's ~/.cache/cc-agterm-remote/clipboard.sock to the
+# The same connections carry the Mac clipboard and link opening to the servers:
+# each forwards its server's ~/.cache/cc-agterm-remote/clipboard.sock to the
 # local socket cc-remote-clipboard answers on (see there).
 #
 #   cc-remote-bridge          run in the foreground (Ctrl+C to stop)
@@ -29,24 +32,25 @@ mkdir -p "$STATE"
 printf '{}\n' > "$LIVE"
 
 paint() {
-    local sid="$1" state="$2" target="${3:-}" tmp
+    local host="$1" sid="$2" state="$3" target="${4:-}" tmp
     # A pane the hook reported itself (CC_REMOTE_PANE, set in plain ssh panes)
     # wins — that is how a claude started BY HAND inside an ssh session, which
-    # appears in no map, still lights up. Otherwise look the session up: exact
-    # key first, then the 8-char short id, which is the UUID's first block.
+    # appears in no map, still lights up. Otherwise look the session up on its
+    # host: exact key first, then the 8-char short id, which is the UUID's
+    # first block.
     if [ -z "$target" ]; then
-        target="$(jq -r --arg s "$sid" '.[$s] // empty' "$MAP" 2>/dev/null)"
+        target="$(map_pane "$host" "$sid")"
     fi
     if [ -z "$target" ]; then
-        target="$(jq -r --arg s "${sid:0:8}" '.[$s] // empty' "$MAP" 2>/dev/null)"
+        target="$(map_pane "$host" "${sid:0:8}")"
     fi
     [ -n "$target" ] || return 0
 
     # Remember pane-reported sessions (a claude started by hand in an ssh pane)
     # so sync_names can mark the pane while it runs and un-mark it when it exits.
-    if [ -n "${3:-}" ]; then
+    if [ -n "${4:-}" ]; then
         tmp="$(mktemp)"
-        jq --arg s "$sid" --arg p "$target" '. + {($s): $p}' "$LIVE" > "$tmp" 2>/dev/null && mv "$tmp" "$LIVE"
+        jq --arg s "$(map_key "$host" "$sid")" --arg p "$target" '. + {($s): $p}' "$LIVE" > "$tmp" 2>/dev/null && mv "$tmp" "$LIVE"
     fi
 
     case "$state" in
@@ -60,14 +64,14 @@ paint() {
 
 if [ "${1:-}" = "--once" ]; then
     echo "config:    $CC_REMOTE_CONFIG"
-    echo "host:      $HOST"
+    echo "hosts:     ${HOSTS[*]} (entries without a host: $LEGACY_HOST)"
     echo "agtermctl: $AGTERMCTL"
     echo "map:       $MAP ($(jq -r 'length' "$MAP" 2>/dev/null) entries)"
     jq -r 'to_entries[] | "  \(.key) -> \(.value)"' "$MAP" 2>/dev/null
     exit 0
 fi
 
-echo "bridging $HOST:~/$REMOTE_STATE/status.jsonl -> agterm (map: $MAP)"
+echo "bridging ~/$REMOTE_STATE/status.jsonl on ${HOSTS[*]} -> agterm (map: $MAP)"
 
 # "⧉ ✳ <name>": a static "✳" marks the pane as Claude, "⧉" as remote. agterm
 # normally names a pane from its OSC title, which Claude writes as "<animated
@@ -78,72 +82,100 @@ pane_label() {
     case "$name" in "⧉ "*) printf '%s' "$name" ;; *) printf '⧉ ✳ %s' "$name" ;; esac
 }
 
+# The entries of pane-map file $2 (map.json or live-panes.json) that belong to
+# host $1, as "id<TAB>pane": its "<host>:<id>" keys, and the keys without a
+# host when it is the legacy host.
+host_entries() {
+    local bare=false
+    [ "$1" = "$LEGACY_HOST" ] && bare=true
+    jq -r --arg p "$(map_key "$1" "")" --argjson bare "$bare" '
+        to_entries[]
+        | if (.key | startswith($p)) then "\(.key | ltrimstr($p))\t\(.value)"
+          elif $bare and (.key | test(":") | not) then "\(.key)\t\(.value)"
+          else empty end' "$2" 2>/dev/null
+}
+
 # Claude Code names a session itself after the first prompt, and that name never
 # reaches the terminal title through `claude attach`. Poll for it and relabel the
 # pane so the sidebar shows Claude's name rather than the one set at launch.
 sync_names() {
-    local agents sid pane name tmp
+    local h
     while :; do
         sleep 60
-        agents="$(ssh "$HOST" 'export PATH="$HOME/.local/bin:$PATH"; claude agents --json' 2>/dev/null)" || continue
-        [ -n "$agents" ] || continue
-        while IFS=$'\t' read -r sid pane; do
-            [ -n "$sid" ] && [ -n "$pane" ] || continue
-            name="$(jq -r --arg s "$sid" \
-                '.[] | select(.sessionId == $s or .id == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
-            [ -n "$name" ] && [ "$name" != "$sid" ] || continue
-            "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
-        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$MAP" 2>/dev/null)
-
-        # Panes running a hand-started claude: Claude Code overwrites the shell's
-        # OSC title with its own "✳ <name>", losing the remote mark. Re-mark them
-        # while the session lives, and un-name the pane once it is gone so it
-        # goes back to following the shell title ("⧉ ~/dir").
-        while IFS=$'\t' read -r sid pane; do
-            [ -n "$sid" ] && [ -n "$pane" ] || continue
-            name="$(jq -r --arg s "$sid" \
-                '.[] | select(.sessionId == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
-            if [ -n "$name" ]; then
-                "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
-            else
-                "$AGTERMCTL" session rename "" --target "$pane" >/dev/null 2>&1
-                tmp="$(mktemp)"
-                jq --arg s "$sid" 'del(.[$s])' "$LIVE" > "$tmp" 2>/dev/null && mv "$tmp" "$LIVE"
-            fi
-        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$LIVE" 2>/dev/null)
+        for h in "${HOSTS[@]}"; do sync_host "$h"; done
     done
 }
-sync_names &
-trap 'kill %1 2>/dev/null' EXIT
 
-while :; do
-    # Each connection forwards its own socket, clipboard.<id>.sock, and points
-    # the clipboard.sock link the server's scripts use at it once it is up. One
-    # fixed path would break: sshd unlinks a forwarded socket when that
-    # connection ends, and an old connection the server notices dead only later
-    # would delete the path the new one had just bound.
-    #
-    # First, over a short connection: make the directory (owner only), drop
-    # sockets of connections that are gone (nothing answers on them), and learn
-    # the remote home, since a forwarded socket path must be absolute.
-    id="$$-$(date +%s)"
-    rhome="$(ssh -o ConnectTimeout=10 "$HOST" "mkdir -p ~/$REMOTE_STATE && chmod 700 ~/$REMOTE_STATE &&
-        for s in ~/$REMOTE_STATE/clipboard.*.sock; do
-            [ -S \"\$s\" ] && command -v nc >/dev/null && ! nc -z -U \"\$s\" 2>/dev/null && rm -f \"\$s\"
-        done; printf %s \"\$HOME\"" 2>/dev/null)"
-    if [ -n "$rhome" ]; then
-        forward=(-R "$rhome/$REMOTE_STATE/clipboard.$id.sock:$CLIPBOARD_SOCK")
-        # A failed forward only loses the clipboard; the status tail keeps running.
-        ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=no \
-            "${forward[@]}" "$HOST" \
-            "ln -sfn clipboard.$id.sock ~/$REMOTE_STATE/clipboard.sock; touch ~/$REMOTE_STATE/status.jsonl; tail -F -n0 ~/$REMOTE_STATE/status.jsonl" 2>/dev/null |
-        while IFS= read -r line; do
-            sid="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
-            state="$(jq -r '.state // empty' <<<"$line" 2>/dev/null)"
-            pane="$(jq -r '.pane // empty' <<<"$line" 2>/dev/null)"
-            [ -n "$sid" ] && [ -n "$state" ] && paint "$sid" "$state" "$pane"
-        done
-    fi
-    echo "connection dropped, reconnecting in 10s" >&2
-    sleep 10
-done
+# One pass of sync_names for host $1, which is skipped while it is down.
+sync_host() {
+    local h="$1" agents sid pane name tmp
+    agents="$(ssh "${SSH_QUICK[@]}" "$h" 'export PATH="$HOME/.local/bin:$PATH"; claude agents --json' 2>/dev/null)" || return 0
+    [ -n "$agents" ] || return 0
+    while IFS=$'\t' read -r sid pane; do
+        [ -n "$sid" ] && [ -n "$pane" ] || continue
+        name="$(jq -r --arg s "$sid" \
+            '.[] | select(.sessionId == $s or .id == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
+        [ -n "$name" ] && [ "$name" != "$sid" ] || continue
+        "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
+    done < <(host_entries "$h" "$MAP")
+
+    # Panes running a hand-started claude: Claude Code overwrites the shell's
+    # OSC title with its own "✳ <name>", losing the remote mark. Re-mark them
+    # while the session lives, and un-name the pane once it is gone so it
+    # goes back to following the shell title ("⧉ ~/dir").
+    while IFS=$'\t' read -r sid pane; do
+        [ -n "$sid" ] && [ -n "$pane" ] || continue
+        name="$(jq -r --arg s "$sid" \
+            '.[] | select(.sessionId == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
+        if [ -n "$name" ]; then
+            "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
+        else
+            "$AGTERMCTL" session rename "" --target "$pane" >/dev/null 2>&1
+            tmp="$(mktemp)"
+            jq --arg s "$(map_key "$h" "$sid")" 'del(.[$s])' "$LIVE" > "$tmp" 2>/dev/null && mv "$tmp" "$LIVE"
+        fi
+    done < <(host_entries "$h" "$LIVE")
+}
+
+# One server's status tail and clipboard forward, reconnecting forever.
+bridge_host() {
+    local h="$1" id rhome forward line sid state pane
+    while :; do
+        # Each connection forwards its own socket, clipboard.<id>.sock, and points
+        # the clipboard.sock link the server's scripts use at it once it is up. One
+        # fixed path would break: sshd unlinks a forwarded socket when that
+        # connection ends, and an old connection the server notices dead only later
+        # would delete the path the new one had just bound.
+        #
+        # First, over a short connection: make the directory (owner only), drop
+        # sockets of connections that are gone (nothing answers on them), and learn
+        # the remote home, since a forwarded socket path must be absolute.
+        id="$$-$(date +%s)"
+        rhome="$(ssh -o ConnectTimeout=10 "$h" "mkdir -p ~/$REMOTE_STATE && chmod 700 ~/$REMOTE_STATE &&
+            for s in ~/$REMOTE_STATE/clipboard.*.sock; do
+                [ -S \"\$s\" ] && command -v nc >/dev/null && ! nc -z -U \"\$s\" 2>/dev/null && rm -f \"\$s\"
+            done; printf %s \"\$HOME\"" 2>/dev/null)"
+        if [ -n "$rhome" ]; then
+            forward=(-R "$rhome/$REMOTE_STATE/clipboard.$id.sock:$CLIPBOARD_SOCK")
+            # A failed forward only loses the clipboard; the status tail keeps running.
+            ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ExitOnForwardFailure=no \
+                "${forward[@]}" "$h" \
+                "ln -sfn clipboard.$id.sock ~/$REMOTE_STATE/clipboard.sock; touch ~/$REMOTE_STATE/status.jsonl; tail -F -n0 ~/$REMOTE_STATE/status.jsonl" 2>/dev/null |
+            while IFS= read -r line; do
+                sid="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
+                state="$(jq -r '.state // empty' <<<"$line" 2>/dev/null)"
+                pane="$(jq -r '.pane // empty' <<<"$line" 2>/dev/null)"
+                [ -n "$sid" ] && [ -n "$state" ] && paint "$h" "$sid" "$state" "$pane"
+            done
+        fi
+        echo "$h: connection dropped, reconnecting in 10s" >&2
+        sleep 10
+    done
+}
+
+sync_names &
+for h in "${HOSTS[@]}"; do bridge_host "$h" & done
+# The loops run until this process goes; launchd stops it with SIGTERM.
+trap 'kill $(jobs -p) 2>/dev/null' EXIT
+trap 'exit 0' TERM INT
+wait
