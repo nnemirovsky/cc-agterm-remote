@@ -52,13 +52,165 @@ host_label() {
     fi
 }
 
-# Point HOST and NAME, which the scripts' remote commands and messages use, at
-# host $1.
+# Host marks: what leads a remote pane's name in agterm's sidebar, so a pane
+# says which server it is on ("ⓣ ✳ <session name>", "ⓣ ~/dir" for a shell).
+# One server keeps the plain remote mark "⧉". With several, each gets the
+# circled form of the first letter (or digit) of its name that no host before
+# it took, so torvalds and ritchie read "ⓣ" and "ⓡ", and a second t-host
+# takes its next letter. A host with no letter left gets "⧉" and its first
+# letter. CC_REMOTE_MARKS ("host=mark") sets any of them; a set mark is never
+# derived for another host.
+#
+# A mark lands in the server's prompt string (install.sh) and in pane names,
+# so it is one word without quotes, backslashes, "$", "`" or "!". One that is
+# not is ignored and named in MARK_ERRORS, which install.sh refuses.
+REMOTE_MARK="⧉"
+CIRCLED_KEYS="abcdefghijklmnopqrstuvwxyz0123456789"
+CIRCLED=(ⓐ ⓑ ⓒ ⓓ ⓔ ⓕ ⓖ ⓗ ⓘ ⓙ ⓚ ⓛ ⓜ ⓝ ⓞ ⓟ ⓠ ⓡ ⓢ ⓣ ⓤ ⓥ ⓦ ⓧ ⓨ ⓩ ⓪ ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨)
+
+mark_ok() {
+    case "$1" in ""|*[[:space:][:cntrl:]]*|*[\'\"\\\$\`!]*) return 1 ;; esac
+}
+
+# The CC_REMOTE_MARKS entry for host $1, valid or not; fails when there is none.
+configured_mark() {
+    local e
+    for e in "${CC_REMOTE_MARKS[@]+"${CC_REMOTE_MARKS[@]}"}"; do
+        [ "${e%%=*}" = "$1" ] && { printf '%s' "${e#*=}"; return 0; }
+    done
+    return 1
+}
+
+# The circled glyph of character $1 (a lowercase letter or a digit).
+circled() {
+    local before
+    case "$1" in ""|?*?) return 1 ;; esac
+    case "$CIRCLED_KEYS" in *"$1"*) ;; *) return 1 ;; esac
+    before="${CIRCLED_KEYS%%"$1"*}"
+    printf '%s' "${CIRCLED[${#before}]}"
+}
+
+# Fill MARKS, MARKS[i] being the mark of HOSTS[i], and MARK_ERRORS. Marks are
+# kept one per line in $taken (they hold no whitespace), so a derived one never
+# repeats a mark already given out. Plain bash 3.2: a chord runs /bin/bash.
+compute_marks() {
+    local i h m lower j g taken=$'\n'
+    MARKS=() MARK_ERRORS=""
+    i=0
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        MARKS[i]=""
+        if m="$(configured_mark "$h")"; then
+            if mark_ok "$m"; then
+                MARKS[i]="$m"
+                taken="$taken$m"$'\n'
+            else
+                MARK_ERRORS="${MARK_ERRORS:+$MARK_ERRORS$'\n'}CC_REMOTE_MARKS: \"$h=$m\" is not one word without quotes, backslashes, \$, \` or !"
+            fi
+        fi
+        i=$((i + 1))
+    done
+    i=0
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        if [ -z "${MARKS[i]}" ]; then
+            m=""
+            if [ "${#HOSTS[@]}" -gt 1 ]; then
+                lower="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+                j=0
+                while [ "$j" -lt "${#lower}" ]; do
+                    if g="$(circled "${lower:j:1}")"; then
+                        case "$taken" in *$'\n'"$g"$'\n'*) ;; *) m="$g"; break ;; esac
+                    fi
+                    j=$((j + 1))
+                done
+                if [ -z "$m" ]; then
+                    m="$REMOTE_MARK${lower:0:1}"
+                    case "$taken" in *$'\n'"$m"$'\n'*) m="$REMOTE_MARK$lower" ;; esac
+                    mark_ok "$m" || m="$REMOTE_MARK"
+                fi
+            else
+                m="$REMOTE_MARK"
+            fi
+            MARKS[i]="$m"
+            taken="$taken$m"$'\n'
+        fi
+        i=$((i + 1))
+    done
+}
+compute_marks
+
+# The mark of host $1: its MARKS entry, or for a host outside HOSTS (a legacy
+# CC_REMOTE_HOST left out of the list) its CC_REMOTE_MARKS entry or "⧉".
+host_mark() {
+    local h i=0 m
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        [ "$h" = "$1" ] && { printf '%s' "${MARKS[i]}"; return; }
+        i=$((i + 1))
+    done
+    if m="$(configured_mark "$1")" && mark_ok "$m"; then printf '%s' "$m"; else printf '%s' "$REMOTE_MARK"; fi
+}
+
+# The configured hosts' marks as {host: mark}.
+host_marks_json() {
+    local h
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        jq -nc --arg h "$h" --arg m "$(host_mark "$h")" '{($h): $m}'
+    done | jq -s -c 'add // {}'
+}
+
+# What the marks stand for, as "ⓣ torvalds · ⓡ ritchie".
+mark_legend() {
+    local h out=""
+    for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
+        out="${out:+$out · }$(host_mark "$h") $(host_label "$h")"
+    done
+    printf '%s' "$out"
+}
+
+# Pane name $1 without the host mark leading it, and the space after it. Any
+# mark counts, not only this configuration's: "⧉" alone or with more after it
+# ("⧉t"), and any circled letter or digit, so a pane named before the marks
+# changed (or before there were marks) is recognised too. Prints the name
+# unchanged when it has no mark. Prefix matches of whole strings rather than
+# bracket expressions, which cut multibyte glyphs apart under launchd's C
+# locale.
+strip_mark() {
+    local n="$1" m w
+    for m in ${MARKS[@]+"${MARKS[@]}"} "${CIRCLED[@]}"; do
+        case "$n" in "$m "*) printf '%s' "${n#"$m "}"; return ;; esac
+    done
+    case "$n" in
+        "$REMOTE_MARK"*" "*) w="${n%% *}"; printf '%s' "${n#"$w "}" ;;
+        *) printf '%s' "$n" ;;
+    esac
+}
+
+# Whether pane name $1 starts with a host mark: a remote pane.
+has_mark() { [ "$(strip_mark "$1")" != "$1" ]; }
+
+# The name of a pane showing a Claude session called $2 on host $1:
+# "<mark> ✳ <name>". A static "✳" marks the pane as Claude: agterm names a pane
+# from its OSC title, which Claude writes as "<animated glyph> <name>", and an
+# explicitly named pane stops following the title, so the glyph would freeze
+# mid-animation. Whatever mark and glyph $2 already carries are replaced, so an
+# old pane name comes out with its host's current mark.
+pane_label() {
+    local n g
+    n="$(strip_mark "$2")"
+    for g in ✳ ◐ ◑ ◒ ◓ ✶ ✻ ✽ '*'; do
+        case "$n" in "$g "*) n="${n#"$g "}"; break ;; esac
+    done
+    printf '%s ✳ %s' "$(host_mark "$1")" "$n"
+}
+
+# Point HOST, NAME and MARK, which the scripts' remote commands and messages
+# use, at host $1.
 use_host() {
     HOST="$1"
     NAME="$(host_label "$1")"
+    MARK="$(host_mark "$1")"
 }
 NAME="$(host_label "$HOST")"
+MARK="$(host_mark "$HOST")"
 
 # Whether $1 is one of the configured hosts.
 is_host() {
