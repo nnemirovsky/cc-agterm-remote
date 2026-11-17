@@ -1,4 +1,4 @@
-# shellcheck shell=bash disable=SC2034
+# shellcheck shell=bash disable=SC2034,SC2153
 # Sourced by the Mac-side cc-agterm-remote scripts: reads the configuration and
 # sets the names they share. Not run on its own.
 #
@@ -42,7 +42,7 @@ SSH_QUICK=(-o BatchMode=yes -o ConnectTimeout="${CC_REMOTE_CONNECT_TIMEOUT:-5}"
 # the host itself.
 host_label() {
     local e
-    for e in ${CC_REMOTE_NAMES[@]+"${CC_REMOTE_NAMES[@]}"}; do
+    for e in "${CC_REMOTE_NAMES[@]+"${CC_REMOTE_NAMES[@]}"}"; do
         [ "${e%%=*}" = "$1" ] && { printf '%s' "${e#*=}"; return; }
     done
     if [ "$1" = "${CC_REMOTE_HOST:-}" ] && [ -n "${CC_REMOTE_NAME:-}" ]; then

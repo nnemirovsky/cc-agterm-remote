@@ -322,6 +322,7 @@ split_choice() {
 # after a first "~<TAB>remote home" line.
 remote_dirs() {
     local args=() r d
+    # shellcheck disable=SC2153 # set by the configuration, not a misspelt CC_REMOTE_HOSTS
     for r in "${CC_REMOTE_ROOTS[@]+"${CC_REMOTE_ROOTS[@]}"}"; do args+=("root=$r"); done
     for d in "${CC_REMOTE_DIRS[@]+"${CC_REMOTE_DIRS[@]}"}"; do args+=("dir=$d"); done
     rbash "${args[@]+"${args[@]}"}" <<'EOS' 2>/dev/null
