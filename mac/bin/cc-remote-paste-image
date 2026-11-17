@@ -5,6 +5,12 @@
 #   cc-remote-paste-image --print    upload and print the remote path, type nothing
 #   cc-remote-paste-image --file P   use P instead of the clipboard
 #   cc-remote-paste-image --force    skip the "is this pane remote?" check
+#   cc-remote-paste-image --host H   upload to server H
+#
+# The image goes to the server the pane talks to: the configured host its ssh
+# command names, or the legacy host for a pane from before there were several
+# (see pane_host in cc-remote-config). --host overrides that, for --print from
+# a local terminal say.
 #
 # The fallback for Ctrl+V. With the bridge up, Ctrl+V in a remote Claude Code
 # prompt reaches the Mac clipboard through the xclip stand-in; this works
@@ -24,13 +30,14 @@ KEEP_DAYS="${CC_REMOTE_PASTE_KEEP_DAYS:-7}"
 case "$KEEP_DAYS" in ''|*[!0-9]*) KEEP_DAYS=7 ;; esac
 TARGET="${AGT_SESSION_ID:-active}"
 
-mode="type"; src=""; force=0
+mode="type"; src=""; force=0; host=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --print) mode=print ;;
         --file)  src="${2:-}"; shift ;;
         --force) force=1 ;;
-        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --host)  host="${2:-}"; shift ;;
+        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -97,6 +104,8 @@ if [ "$force" = 0 ] && [ "$mode" = type ]; then
 fi
 
 # --- 3. copy it over ---------------------------------------------------------
+[ -n "$host" ] || host="$(pane_host "$TARGET")"
+use_host "$host"
 ext="${src##*.}"; case "$ext" in "$src"|*[!A-Za-z0-9]*) ext=png ;; esac
 name="paste-$(date +%Y%m%d-%H%M%S)-$$.$ext"
 
