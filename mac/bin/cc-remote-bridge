@@ -65,6 +65,8 @@ paint() {
 if [ "${1:-}" = "--once" ]; then
     echo "config:    $CC_REMOTE_CONFIG"
     echo "hosts:     ${HOSTS[*]} (entries without a host: $LEGACY_HOST)"
+    echo "marks:     $(mark_legend)"
+    [ -z "$MARK_ERRORS" ] || printf '  %s\n' "$MARK_ERRORS"
     echo "agtermctl: $AGTERMCTL"
     echo "map:       $MAP ($(jq -r 'length' "$MAP" 2>/dev/null) entries)"
     jq -r 'to_entries[] | "  \(.key) -> \(.value)"' "$MAP" 2>/dev/null
@@ -72,15 +74,6 @@ if [ "${1:-}" = "--once" ]; then
 fi
 
 echo "bridging ~/$REMOTE_STATE/status.jsonl on ${HOSTS[*]} -> agterm (map: $MAP)"
-
-# "⧉ ✳ <name>": a static "✳" marks the pane as Claude, "⧉" as remote. agterm
-# normally names a pane from its OSC title, which Claude writes as "<animated
-# glyph> <name>"; an explicitly named pane stops following the title, so the
-# glyph would freeze mid-animation.
-pane_label() {
-    local name="${1#[✳◐◑◒◓✶✻✽*] }"
-    case "$name" in "⧉ "*) printf '%s' "$name" ;; *) printf '⧉ ✳ %s' "$name" ;; esac
-}
 
 # The entries of pane-map file $2 (map.json or live-panes.json) that belong to
 # host $1, as "id<TAB>pane": its "<host>:<id>" keys, and the keys without a
@@ -97,7 +90,10 @@ host_entries() {
 
 # Claude Code names a session itself after the first prompt, and that name never
 # reaches the terminal title through `claude attach`. Poll for it and relabel the
-# pane so the sidebar shows Claude's name rather than the one set at launch.
+# pane (pane_label: "<host mark> ✳ <name>") so the sidebar shows Claude's name
+# rather than the one set at launch. A pane whose session has no name yet keeps
+# its name with the host's current mark in front, which re-marks a pane named
+# before the marks changed.
 sync_names() {
     local h
     while :; do
@@ -106,29 +102,48 @@ sync_names() {
     done
 }
 
+# Rename agterm pane $1 to $2, unless it is gone or already has that name, from
+# the {pane: name} JSON in $3.
+rename_pane() {
+    local cur
+    cur="$(jq -r --arg p "$1" 'if has($p) then "+" + .[$p] else "-" end' <<<"$3" 2>/dev/null)"
+    case "$cur" in "+$2"|"-"|"") return 0 ;; esac
+    "$AGTERMCTL" session rename "$2" --target "$1" >/dev/null 2>&1
+}
+
 # One pass of sync_names for host $1, which is skipped while it is down.
 sync_host() {
-    local h="$1" agents sid pane name tmp
+    local h="$1" agents panes sid pane name cur tmp seen=" "
     agents="$(ssh "${SSH_QUICK[@]}" "$h" 'export PATH="$HOME/.local/bin:$PATH"; claude agents --json' 2>/dev/null)" || return 0
     [ -n "$agents" ] || return 0
+    panes="$("$AGTERMCTL" tree --json 2>/dev/null |
+             jq -c '[.result.tree.workspaces[].sessions[] | {key: .id, value: (.name // "")}] | from_entries' 2>/dev/null)"
+    [ -n "$panes" ] || return 0
+    # A pane is mapped under its session's short id and its uuid: one pass each.
     while IFS=$'\t' read -r sid pane; do
         [ -n "$sid" ] && [ -n "$pane" ] || continue
+        case "$seen" in *" $pane "*) continue ;; esac
+        seen="$seen$pane "
         name="$(jq -r --arg s "$sid" \
             '.[] | select(.sessionId == $s or .id == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
-        [ -n "$name" ] && [ "$name" != "$sid" ] || continue
-        "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
+        if [ -z "$name" ] || [ "$name" = "$sid" ]; then
+            cur="$(jq -r --arg p "$pane" '.[$p] // empty' <<<"$panes")"
+            has_mark "$cur" || continue
+            name="$cur"
+        fi
+        rename_pane "$pane" "$(pane_label "$h" "$name")" "$panes"
     done < <(host_entries "$h" "$MAP")
 
     # Panes running a hand-started claude: Claude Code overwrites the shell's
     # OSC title with its own "✳ <name>", losing the remote mark. Re-mark them
     # while the session lives, and un-name the pane once it is gone so it
-    # goes back to following the shell title ("⧉ ~/dir").
+    # goes back to following the shell title ("<host mark> ~/dir").
     while IFS=$'\t' read -r sid pane; do
         [ -n "$sid" ] && [ -n "$pane" ] || continue
         name="$(jq -r --arg s "$sid" \
             '.[] | select(.sessionId == $s) | .name // empty' <<<"$agents" 2>/dev/null | head -1)"
         if [ -n "$name" ]; then
-            "$AGTERMCTL" session rename "$(pane_label "$name")" --target "$pane" >/dev/null 2>&1
+            rename_pane "$pane" "$(pane_label "$h" "$name")" "$panes"
         else
             "$AGTERMCTL" session rename "" --target "$pane" >/dev/null 2>&1
             tmp="$(mktemp)"
