@@ -49,6 +49,12 @@ die() {
 SCOPE="$NAME"
 multi_host && SCOPE="remote"
 
+# What prompts and messages call HOST: with several servers its name after its
+# mark, the one its panes carry ("ⓣ torvalds"), else its name.
+marked_name() {
+    if multi_host; then printf '%s %s' "$MARK" "$NAME"; else printf '%s' "$NAME"; fi
+}
+
 WANT_HOST=""
 if [ "${1:-}" = "--host" ]; then
     WANT_HOST="${2:?usage: cc-remote-attach --host <host> <command>}"
@@ -272,12 +278,15 @@ EOS
 # most recently active first (`active`, from all_sessions).
 #
 # The input comes from `everywhere`: each row carries its `host`, which leads
-# its label when there are several hosts and is part of its id
-# ("bg:<host>:<id>", "app:<host>:<uuid>"; see split_choice). A host that did not
-# answer gets an "unavailable" row ("down:<host>") above the stopped ones.
+# its label, after the host's mark, when there are several hosts, and is part of
+# its id ("bg:<host>:<id>", "app:<host>:<uuid>"; see split_choice). A host that
+# did not answer gets an "unavailable" row ("down:<host>") above the stopped
+# ones. With several hosts a first row ("legend") says which mark is which
+# server's, as pane names carry them; pick_session opens on the row after it.
 SEP_ID="sep"
 picker_rows() {
-    jq -c --argjson multi "$(multi_host && echo true || echo false)" --argjson names "$(host_labels_json)" '
+    jq -c --argjson multi "$(multi_host && echo true || echo false)" --argjson names "$(host_labels_json)" \
+          --argjson marks "$(host_marks_json)" --arg legend "$(mark_legend)" '
         def running: .kind == "background" and has("pid");
         def stopped: .kind == "background" and (has("pid") | not);
         def app: .kind != "background" and .kind != "unreachable";
@@ -285,20 +294,33 @@ picker_rows() {
         def badge: if .state == "working" then "busy"
                    elif .state == "blocked" then "waiting"
                    else (.status // .state // "?") end;
-        def host_tag: if $multi then "\($names[.host] // .host) · " else "" end;
+        def host_name: "\($marks[.host] // "?") \($names[.host] // .host)";
+        def host_tag: if $multi then "\(host_name) · " else "" end;
         ([.[] | select(running or app) | .sessionId]) as $live
-        | ([.[] | select(running)] | sort_by(order)
+        | (if $multi then [{id: "legend", label: $legend, subtitle: "which server a pane is on: the mark leading its name"}] else [] end)
+        + ([.[] | select(running)] | sort_by(order)
            | map({id: "bg:\(.host):\(.id)", label: "\(host_tag)\(badge) · \(.name // .id)", subtitle: .cwd}))
         + [.[] | select(app)
            | {id: "app:\(.host):\(.sessionId)", label: "\(host_tag)from app · \(.name)", subtitle: .cwd}]
         + [.[] | select(.kind == "unreachable")
-           | {id: "down:\(.host)", label: "\($names[.host] // .host) · unavailable",
+           | {id: "down:\(.host)", label: "\(if $multi then host_name else $names[.host] // .host end) · unavailable",
               subtitle: "ssh \(.host) did not answer, so its sessions are missing"}]
         + ([.[] | select(stopped and (.sessionId | IN($live[]) | not))]
            | group_by(.sessionId) | map(max_by(.active // 0)) | sort_by(-(.active // 0))
            | if length == 0 then [] else
                [{id: "'"$SEP_ID"'", label: "──────── stopped · pick to resume ────────"}]
                + map({id: "bg:\(.host):\(.id)", label: "\(host_tag)\(.name // .id)", subtitle: .cwd}) end)'
+}
+
+# Open a session picker on picker_rows' rows $1 with prompt $2, the first
+# session row highlighted (the legend above it would only cancel), and print the
+# picked row's id. pick prints {"id":…,"result":"picked","label":…}; `result` is
+# a string, so index only `.id`, and treat anything but "picked" as a cancel.
+pick_session() {
+    local sel
+    sel="$(jq -r '[.[] | select(.id | test("^(bg|app):"))][0].id // empty' <<<"$1" 2>/dev/null)"
+    printf '%s' "$1" | "$AGTERMCTL" pick --prompt "$2" ${sel:+--select "$sel"} 2>/dev/null |
+        jq -r 'select(.result == "picked") | .id // empty'
 }
 
 # Split a picker row id ("bg:<host>:<id>", "app:<host>:<uuid>") into KIND,
@@ -390,13 +412,13 @@ await_dirs() {
 }
 
 # Ask which host a new session or shell goes to, the default (first) one on
-# top, and switch to it. Fails on cancel. With one host, or --host given, there
-# is nothing to ask.
+# top, and switch to it. Each row leads with the mark the host's panes carry.
+# Fails on cancel. With one host, or --host given, there is nothing to ask.
 choose_host() {
     local h choice
     { [ -n "$WANT_HOST" ] || ! multi_host; } && return 0
     choice="$(for h in "${HOSTS[@]}"; do
-                  jq -nc --arg h "$h" --arg l "$(host_label "$h")" --arg d "${HOSTS[0]}" \
+                  jq -nc --arg h "$h" --arg l "$(host_mark "$h") $(host_label "$h")" --arg d "${HOSTS[0]}" \
                       '{id: $h, label: $l, subtitle: (if $h == $d then "default · ssh \($h)" else "ssh \($h)" end)}'
               done | jq -s -c . | "$AGTERMCTL" pick --prompt "$1" 2>/dev/null |
               jq -r 'select(.result == "picked") | .id // empty')"
@@ -606,7 +628,7 @@ case "${1:-}" in
             { [ -n "$WANT_HOST" ] || ! multi_host; } || prefetch_dirs
             choose_host "new shell session on…" || { echo "cancelled" >&2; exit 0; }
             await_dirs
-            dir="$(pick_dir "new $NAME shell session in…" "$DIRS_FILE")"
+            dir="$(pick_dir "new $(marked_name) shell session in…" "$DIRS_FILE")"
             rm -rf "${DIRS_TMP:-}"
         fi
         [ -n "$dir" ] || { echo "cancelled" >&2; exit 0; }
@@ -648,7 +670,7 @@ case "${1:-}" in
                      jq -nc '{id: "restart", label: "restart", subtitle: "Claude is told, and starts again the shells, monitors and agents it had running"}'
                      jq -nc --arg d "$dir" '{id: "stop", label: "stop and close this pane", subtitle: $d}'
                      cleanup_row "$info" stop; } | jq -s -c . |
-                   "$AGTERMCTL" pick --prompt "stop \"$name\"?" 2>/dev/null |
+                   "$AGTERMCTL" pick --prompt "stop \"$name\"$(multi_host && printf ' on %s' "$(marked_name)")?" 2>/dev/null |
                    jq -r 'select(.result == "picked") | .id // empty')"
         case "$confirm" in
             restart) restart_session "$cc_id" "$(jq -r '.sessionId' <<<"$row")" "$dir" restarted ;;
@@ -669,8 +691,7 @@ case "${1:-}" in
             die "no running sessions on $SCOPE servers${down:+ (no answer from $down)}"
         fi
 
-        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "kill which $SCOPE Claude Code session?" 2>/dev/null |
-                  jq -r 'select(.result == "picked") | .id // empty')"
+        choice="$(pick_session "$items" "kill which $SCOPE Claude Code session?")"
         split_choice "$choice" || { echo "cancelled" >&2; exit 0; }
 
         target="$TARGET"
@@ -680,7 +701,7 @@ case "${1:-}" in
         else
             label="$(jq -r --arg h "$HOST" --arg i "$target" '.[] | select(.host == $h and .id == $i) | .name' <<<"$sessions")"
         fi
-        multi_host && label="$label on $NAME"
+        multi_host && label="$label on $(marked_name)"
 
         confirm="$(printf '%s\n' "cancel" "kill $label" |
                    "$AGTERMCTL" pick --prompt "confirm" 2>/dev/null |
@@ -759,7 +780,7 @@ case "${1:-}" in
             { [ -n "$WANT_HOST" ] || ! multi_host; } || prefetch_dirs
             choose_host "new Claude Code session on…" || { echo "cancelled" >&2; exit 0; }
             await_dirs
-            dir="$(pick_dir "new $NAME Claude Code session in…" "$DIRS_FILE")"
+            dir="$(pick_dir "new $(marked_name) Claude Code session in…" "$DIRS_FILE")"
             rm -rf "${DIRS_TMP:-}"
         fi
         [ -n "$dir" ] || { echo "cancelled" >&2; exit 0; }
@@ -778,11 +799,8 @@ case "${1:-}" in
             down="$(unreachable <<<"$sessions")"
             die "no sessions on $SCOPE servers${down:+ (no answer from $down)}"
         fi
-        # pick prints {"id":…,"result":"picked","label":…}; `result` is a string,
-        # so index only `.id`, and treat anything but "picked" as a cancel. The
-        # separator and "unavailable" rows cancel too.
-        choice="$(printf '%s' "$items" | "$AGTERMCTL" pick --prompt "$SCOPE Claude Code sessions" 2>/dev/null |
-                  jq -r 'select(.result == "picked") | .id // empty')"
+        # The legend, separator and "unavailable" rows cancel.
+        choice="$(pick_session "$items" "$SCOPE Claude Code sessions")"
         split_choice "$choice" || { echo "cancelled" >&2; exit 0; }
 
         kind="$KIND"
@@ -808,7 +826,7 @@ case "${1:-}" in
         # into a previous picker, so the last option just cancels. "@cleanup:<verb>"
         # stands for the clean-up row, left out when there is nothing to clean up.
         prompt="$name"
-        multi_host && prompt="$name ($NAME)"
+        multi_host && prompt="$name ($(marked_name))"
         action="$(action_items "$info" "${actions[@]}" |
                   "$AGTERMCTL" pick --prompt "$prompt" 2>/dev/null |
                   jq -r 'select(.result == "picked") | .id // empty')"
